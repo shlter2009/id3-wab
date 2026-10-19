@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hmac
 import io
+import json
 import os
 import re
 import secrets
@@ -12,18 +13,20 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse
 
 from flask import Flask, jsonify, request, send_file, session
 from werkzeug.exceptions import HTTPException
+from PIL import Image, ImageOps
 
 from .core import Library, Metadata, Network, confirm_metadata, read_embedded_cover, read_hint, safe_name, same_identity
+from .artists import canonical_artist, validate_artists
 
 AUDIO_EXTENSIONS = {'.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg', '.opus', '.aiff', '.aif', '.wma'}
-ACTIVE = {'queued', 'searching', 'converting'}
+ACTIVE = {'queued', 'searching', 'converting', 'covering'}
 METADATA_FIELDS = ('title', 'artist', 'album', 'year', 'genre')
 
 
@@ -80,6 +83,14 @@ class Job:
     output: Path | None = None
     duplicate: bool = False
     has_cover: bool = False
+    artists: list[dict] = field(default_factory=list)
+    original_hint: Metadata = field(default_factory=Metadata)
+    cover_data: bytes | None = None
+    cover_for: Metadata | None = None
+    cover_source: str = ''
+    cover_version: int = 0
+    cover_message: str = ''
+    cover_disabled: bool = False
     updated: float = field(default_factory=time.time)
 
 
@@ -139,10 +150,14 @@ class Jobs:
                     'hint': asdict(job.hint), 'candidates': [asdict(c) for c in job.candidates],
                     'metadata': asdict(job.metadata) if job.metadata else None,
                     'duplicate': job.duplicate,
+                    'artwork': {'available': bool(job.cover_data), 'source': job.cover_source,
+                                'version': job.cover_version, 'message': job.cover_message,
+                                'disabled': job.cover_disabled,
+                                'metadata': asdict(job.cover_for) if job.cover_for else None},
                     'download': f'/api/jobs/{job.id}/download' if job.output else None,
                     'cover': f'/api/jobs/{job.id}/cover' if job.output and job.has_cover else None}
 
-    def prepare(self, job):
+    def prepare(self, job, query=None, redownload=True):
         network = None
         try:
             self.update(job, status='searching', progress=.05, error='', warning='')
@@ -150,11 +165,20 @@ class Jobs:
             if job.remote:
                 local = self.workspace(job.owner) / job.id / safe_name(job.name)
                 local.parent.mkdir(parents=True, exist_ok=True)
-                network.download(job.source, local, lambda p: self.update(job, progress=.05 + p * .25))
+                if redownload or not local.is_file():
+                    network.download(job.source, local, lambda p: self.update(job, progress=.05 + p * .25))
             else:
                 local = Path(job.source)
-            hint = read_hint(local)
-            self.update(job, hint=hint, progress=.35)
+            original = read_hint(local, job.artists)
+            hint = query or original
+            self.update(job, hint=hint, original_hint=original, progress=.35)
+            try:
+                embedded = read_embedded_cover(local) if same_identity(hint, original) else None
+            except Exception:
+                embedded = None
+            self.update(job, cover_data=embedded, cover_for=original if embedded else None,
+                        cover_source='원본 내장 커버' if embedded else '',
+                        cover_version=job.cover_version + 1, cover_message='', cover_disabled=False)
             candidates = []
             warning = ''
             try:
@@ -162,8 +186,12 @@ class Jobs:
                     time.sleep(max(0, 1.1 - (time.monotonic() - self.last_mb)))
                     self.last_mb = time.monotonic()
                     candidates = network.search(hint)
+                    candidates = [replace(candidate, artist=canonical_artist(candidate.artist, job.artists))
+                                  for candidate in candidates]
             except Exception:
                 warning = '음악 정보 검색에 연결하지 못했습니다. 원본 정보를 확인하거나 직접 입력할 수 있습니다.'
+            if job.artists and hint.artist not in {artist['name'] for artist in job.artists}:
+                warning = ('아티스트 목록과 일치하는 이름을 찾지 못했습니다. 가수를 직접 확인하세요. ' + warning).strip()
             self.update(job, hint=hint, candidates=candidates, warning=warning,
                         status='awaiting', progress=.4)
         except Exception as exc:
@@ -172,23 +200,74 @@ class Jobs:
             if network is not None and hasattr(network, 'http'):
                 network.http.close()
 
+    @staticmethod
+    def fetch_cover(network, metadata):
+        errors = []
+        ids = list(dict.fromkeys([metadata.release_id, *metadata.other_release_ids]))
+        if not any(ids):
+            return None, '', '앨범 후보를 선택한 뒤 커버를 찾거나 이미지를 직접 올려주세요.'
+        for index, release_id in enumerate(ids[:4]):
+            if not release_id:
+                continue
+            try:
+                picture = network.cover(release_id)
+                if picture:
+                    return picture, ('선택한 발매판' if index == 0 else '같은 앨범의 다른 발매판'), ''
+            except Exception:
+                errors.append('온라인 커버 요청에 실패했습니다.')
+        return None, '', ('온라인 커버 요청에 실패했습니다. 다시 시도하거나 이미지를 올려주세요.' if errors
+                          else '해당 앨범의 커버가 없습니다. 다른 발매판을 선택하거나 이미지를 올려주세요.')
+
+    def preview_cover(self, job, metadata):
+        network = None
+        try:
+            network = self.network_factory()
+            picture, source, message = self.fetch_cover(network, metadata)
+            if picture is None and same_identity(metadata, job.original_hint):
+                local = (self.workspace(job.owner) / job.id / safe_name(job.name)) if job.remote else Path(job.source)
+                picture = read_embedded_cover(local)
+                if picture:
+                    source, message = '원본 내장 커버', ''
+            self.update(job, cover_data=picture, cover_for=metadata,
+                        cover_source=source, cover_message=message,
+                        cover_disabled=False,
+                        cover_version=job.cover_version + 1)
+        except Exception:
+            self.update(job, cover_data=None, cover_for=metadata, cover_source='',
+                        cover_version=job.cover_version + 1,
+                        cover_message='커버를 확인하지 못했습니다. 다시 시도하거나 이미지를 올려주세요.')
+        finally:
+            if network is not None and hasattr(network, 'http'):
+                network.http.close()
+            self.update(job, status='awaiting', progress=.4)
+
     def convert(self, job):
         network = None
         try:
             network = self.network_factory()
             local = (self.workspace(job.owner) / job.id / safe_name(job.name)) if job.remote else Path(job.source)
-            cover = None
+            cover = job.cover_data if (job.cover_source == '직접 올린 이미지' or
+                    job.cover_for and same_identity(job.metadata, job.cover_for)) else None
             warnings = []
-            if job.metadata.release_id:
+            checked = bool(job.cover_for and same_identity(job.metadata, job.cover_for))
+            if not cover and checked and job.cover_message:
+                warnings.append(job.cover_message)
+            if cover is None and job.metadata.release_id and not checked and not job.cover_disabled:
                 try:
-                    cover = network.cover(job.metadata.release_id)
+                    cover, source, message = self.fetch_cover(network, job.metadata)
+                    if cover:
+                        self.update(job, cover_source=source)
+                    elif message:
+                        warnings.append(message)
                 except Exception:
                     warnings.append('온라인 커버를 가져오지 못했습니다.')
-            if cover is None and same_identity(job.metadata, job.hint):
+            if cover is None and not checked and not job.cover_disabled and same_identity(job.metadata, job.original_hint):
                 try:
                     cover = read_embedded_cover(local)
                 except Exception:
                     warnings.append('원본 커버를 읽지 못했습니다.')
+            if cover is None and not warnings and not job.cover_disabled:
+                warnings.append('사용 가능한 커버가 없어 커버 없이 저장했습니다.')
             # Serialize library writes for a session; the core also takes an OS lock.
             with self.library_locks[job.owner]:
                 library = Library(self.workspace(job.owner) / 'library')
@@ -276,6 +355,26 @@ def create_app(config=None, network_factory=None):
             raise ValueError('JSON 객체를 입력하세요.')
         return data
 
+    def artist_rules(value):
+        return validate_artists(value)
+
+    def chosen_metadata(job, data):
+        values = data.get('metadata', {})
+        if not isinstance(values, dict) or any(not isinstance(values.get(k), str) or len(values[k]) > 1000 for k in METADATA_FIELDS):
+            raise ValueError('메타데이터 입력을 확인하세요.')
+        index = data.get('candidate')
+        if index is not None and (type(index) is not int or not 0 <= index < len(job.candidates)):
+            raise ValueError('선택한 검색 결과가 올바르지 않습니다.')
+        values = {k: values[k] for k in METADATA_FIELDS}
+        values['artist'] = canonical_artist(values['artist'], job.artists)
+        selected = job.candidates[index] if index is not None else job.hint
+        selected = replace(selected, artist=canonical_artist(selected.artist, job.artists))
+        return confirm_metadata(values, selected)
+
+    @app.post('/api/artists/validate')
+    def validate_artist_list():
+        return jsonify(artists=artist_rules(json_body().get('artists', [])))
+
     @app.post('/api/login')
     def login():
         data = json_body()
@@ -302,7 +401,12 @@ def create_app(config=None, network_factory=None):
         if suffix not in AUDIO_EXTENSIONS:
             raise ValueError('지원하는 오디오 파일 형식이 아닙니다.')
         name = safe_name(Path(original).stem) + suffix
+        try:
+            artists = artist_rules(json.loads(request.form.get('artists', '[]')))
+        except json.JSONDecodeError as exc:
+            raise ValueError('아티스트 목록 형식이 올바르지 않습니다.') from exc
         job = jobs.add(session['owner'], name)
+        job.artists = artists
         folder = jobs.workspace(job.owner) / job.id
         local = folder / name
         try:
@@ -339,7 +443,9 @@ def create_app(config=None, network_factory=None):
         if not any(host == h or h.startswith('*.') and host.endswith(h[1:]) for h in jobs.hosts):
             raise ValueError('허용되지 않은 호스트입니다. 파일 업로드를 이용하세요.')
         name = safe_name(Path(unquote(parsed.path)).name or 'download.audio')
+        artists = artist_rules(data.get('artists', []))
         job = jobs.add(session['owner'], name, url, remote=True)
+        job.artists = artists
         jobs.executor.submit(jobs.prepare, job)
         return jsonify(job=jobs.view(job)), 202
 
@@ -347,17 +453,10 @@ def create_app(config=None, network_factory=None):
     def confirm(job_id):
         job = owned(job_id)
         data = json_body()
-        values = data.get('metadata', {})
-        if not isinstance(values, dict) or any(not isinstance(values.get(k), str) or len(values[k]) > 1000 for k in METADATA_FIELDS):
-            raise ValueError('메타데이터 입력을 확인하세요.')
         with jobs.lock:
             if job.status != 'awaiting':
                 return jsonify(error='현재 작업은 메타데이터 확인 단계가 아닙니다.'), 409
-            index = data.get('candidate')
-            if index is not None and (type(index) is not int or not 0 <= index < len(job.candidates)):
-                raise ValueError('선택한 검색 결과가 올바르지 않습니다.')
-            selected = job.candidates[index] if index is not None else job.hint
-            meta = confirm_metadata({k: values[k] for k in METADATA_FIELDS}, selected)
+            meta = chosen_metadata(job, data)
             jobs.update(job, metadata=meta, status='converting', progress=.45, error='')
         jobs.executor.submit(jobs.convert, job)
         return jsonify(job=jobs.view(job)), 202
@@ -365,12 +464,87 @@ def create_app(config=None, network_factory=None):
     @app.post('/api/jobs/<job_id>/retry')
     def retry(job_id):
         job = owned(job_id)
+        data = request.get_json(silent=True)
+        if data is not None and not isinstance(data, dict):
+            raise ValueError('JSON 객체를 입력하세요.')
+        artists = artist_rules(data['artists']) if data and 'artists' in data else job.artists
         with jobs.lock:
             if job.status != 'failed':
                 return jsonify(error='실패한 작업만 재시도할 수 있습니다.'), 409
-            jobs.update(job, status='queued', progress=0, error='')
+            jobs.update(job, artists=artists, status='queued', progress=0, error='')
         jobs.executor.submit(jobs.prepare, job)
         return jsonify(job=jobs.view(job)), 202
+
+    @app.post('/api/jobs/<job_id>/research')
+    def research(job_id):
+        job, data = owned(job_id), json_body()
+        artists = artist_rules(data.get('artists', []))
+        query = None
+        if data.get('metadata') is not None:
+            values = data['metadata']
+            if not isinstance(values, dict) or any(not isinstance(values.get(k), str) or len(values[k]) > 1000 for k in METADATA_FIELDS):
+                raise ValueError('검색할 곡 정보를 확인하세요.')
+            if not values['title'].strip():
+                raise ValueError('검색할 곡 제목을 입력하세요.')
+            query = Metadata(**{k: values[k].strip() for k in METADATA_FIELDS})
+            query.artist = canonical_artist(query.artist, artists)
+        with jobs.lock:
+            if job.status != 'awaiting':
+                return jsonify(error='정보 확인 대기 중인 곡만 다시 검색할 수 있습니다.'), 409
+            jobs.update(job, artists=artists, status='queued', candidates=[], error='')
+        jobs.executor.submit(jobs.prepare, job, query, False)
+        return jsonify(job=jobs.view(job)), 202
+
+    @app.post('/api/jobs/<job_id>/artwork/search')
+    def find_artwork(job_id):
+        job, data = owned(job_id), json_body()
+        with jobs.lock:
+            if job.status != 'awaiting':
+                return jsonify(error='현재 작업이 끝난 뒤 커버를 확인하세요.'), 409
+            metadata = chosen_metadata(job, data)
+            jobs.update(job, status='covering', cover_message='')
+        jobs.executor.submit(jobs.preview_cover, job, metadata)
+        return jsonify(job=jobs.view(job)), 202
+
+    @app.post('/api/jobs/<job_id>/artwork/upload')
+    def upload_artwork(job_id):
+        job = owned(job_id)
+        if job.status != 'awaiting':
+            return jsonify(error='현재 작업이 끝난 뒤 이미지를 올려주세요.'), 409
+        image_file = request.files.get('file')
+        if not image_file:
+            raise ValueError('이미지 파일을 선택하세요.')
+        data = image_file.stream.read(10 * 1024 * 1024 + 1)
+        if len(data) > 10 * 1024 * 1024:
+            raise ValueError('커버 이미지는 최대 10 MiB입니다.')
+        try:
+            with Image.open(io.BytesIO(data)) as image:
+                if image.format not in {'JPEG', 'PNG', 'WEBP'} or image.width * image.height > 16_000_000:
+                    raise ValueError('JPEG·PNG·WebP 이미지와 최대 1,600만 화소를 지원합니다.')
+                image.verify()
+            with Image.open(io.BytesIO(data)) as image:
+                image = ImageOps.exif_transpose(image).convert('RGB')
+                image.thumbnail((1024, 1024))
+                result = io.BytesIO()
+                image.save(result, format='JPEG', quality=88)
+        except (OSError, Image.DecompressionBombError) as exc:
+            raise ValueError('이미지를 읽지 못했습니다. JPEG·PNG·WebP 파일을 선택하세요.') from exc
+        with jobs.lock:
+            if job.status != 'awaiting':
+                return jsonify(error='현재 작업이 끝난 뒤 이미지를 올려주세요.'), 409
+            jobs.update(job, cover_data=result.getvalue(), cover_for=None, cover_source='직접 올린 이미지',
+                        cover_disabled=False, cover_message='', cover_version=job.cover_version + 1)
+        return jsonify(job=jobs.view(job))
+
+    @app.delete('/api/jobs/<job_id>/artwork')
+    def remove_artwork(job_id):
+        job = owned(job_id)
+        with jobs.lock:
+            if job.status != 'awaiting':
+                return jsonify(error='현재 작업이 끝난 뒤 커버를 변경하세요.'), 409
+            jobs.update(job, cover_data=None, cover_for=None, cover_source='', cover_disabled=True,
+                        cover_message='커버 없이 저장하도록 선택했습니다.', cover_version=job.cover_version + 1)
+        return jsonify(job=jobs.view(job))
 
     @app.delete('/api/jobs/<job_id>')
     def remove(job_id):
@@ -400,6 +574,8 @@ def create_app(config=None, network_factory=None):
     @app.get('/api/jobs/<job_id>/cover')
     def cover(job_id):
         job = owned(job_id)
+        if job.status != 'completed' and job.cover_data:
+            return send_file(io.BytesIO(job.cover_data), mimetype='image/jpeg')
         if not job.output:
             return '', 404
         picture = read_embedded_cover(job.output)

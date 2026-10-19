@@ -288,3 +288,43 @@ def test_wav_id3_hints_and_embedded_art(wav):
     hint = read_hint(wav)
     assert (hint.title, hint.artist, hint.album, hint.year) == ('Tagged title', 'Tagged artist', 'Tagged album', '2023')
     assert Image.open(io.BytesIO(read_embedded_cover(wav))).size == (32, 32)
+
+
+def test_registered_artist_and_existing_tag_priority(tmp_path, wav):
+    from music_manager.artists import validate_artists
+    rules = validate_artists([{'name': 'Drake', 'aliases': ['드레이크']}])
+    reversed_name = tmp_path / 'Wu-Tang Forever - Drake (128k).wav'
+    shutil.copyfile(wav, reversed_name)
+    hint = read_hint(reversed_name, rules)
+    assert hint.artist == 'Drake' and hint.title == 'Wu-Tang Forever'
+    target, _ = Library(tmp_path / 'out').process(wav, Metadata('Actual tag title', '드레이크'))
+    hint = read_hint(target, rules)
+    assert hint.artist == 'Drake' and hint.title == 'Actual tag title'
+
+
+def test_existing_mp3_audio_packets_are_not_reencoded(tmp_path, wav):
+    original = tmp_path / '128k.mp3'
+    subprocess.run(['ffmpeg', '-v', 'error', '-i', str(wav), '-c:a', 'libmp3lame', '-b:a', '128k', str(original)], check=True)
+    def packet_hash(path):
+        return subprocess.run(['ffmpeg', '-v', 'error', '-i', str(path), '-map', '0:a:0', '-c:a', 'copy',
+                               '-f', 'hash', '-hash', 'sha256', '-'], capture_output=True, text=True, check=True).stdout
+    before = packet_hash(original)
+    target, _ = Library(tmp_path / 'out').process(original, Metadata('New tags', 'Artist'), cover())
+    assert packet_hash(target) == before
+    assert ID3(target).version == (2, 3, 0)
+    assert ID3(target).getall('APIC')
+
+
+def test_cover_alternatives_are_limited_to_same_release_group(monkeypatch):
+    network = Network()
+    monkeypatch.setattr(network, 'json', lambda *a, **kw: {'recordings': [{
+        'title': 'Song', 'artist-credit': [{'name': 'Artist'}], 'releases': [
+            {'id': 'first', 'title': 'Album', 'release-group': {'id': 'same', 'primary-type': 'Album'}},
+            {'id': 'second', 'title': 'Album', 'release-group': {'id': 'same', 'primary-type': 'Album'}},
+            {'id': 'other', 'title': 'Album', 'release-group': {'id': 'other', 'primary-type': 'Album'}}]}]})
+    candidates = network.search(Metadata('Song', 'Artist'))
+    first = next(c for c in candidates if c.release_id == 'first')
+    assert first.other_release_ids == ('second',)
+    values = {key: getattr(first, key) for key in ('title', 'artist', 'album', 'year', 'genre')}
+    assert confirm_metadata(values, first).other_release_ids == ('second',)
+    assert confirm_metadata(dict(values, album='Changed'), first).other_release_ids == ()

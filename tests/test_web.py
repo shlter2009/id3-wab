@@ -193,3 +193,152 @@ def test_public_network_rejects_internal_and_unlisted_hosts(monkeypatch):
     with pytest.raises(ValueError):
         network.validate('https://user:password@example.com/song.mp3')
     network.http.close()
+
+
+def image_bytes():
+    from PIL import Image
+    stream = io.BytesIO()
+    Image.new('RGB', (60, 60), 'navy').save(stream, 'PNG')
+    return stream.getvalue()
+
+
+def test_artist_rules_and_research(app, audio):
+    import json
+    client = app.test_client()
+    rules = [{'name': 'Drake', 'aliases': ['드레이크']}]
+    validated = client.post('/api/artists/validate', json={'artists': rules}, headers=HEADERS)
+    assert validated.status_code == 200 and validated.json['artists'] == rules
+    assert client.post('/api/artists/validate', json={'artists': [*rules, {'name': 'Drake'}]}, headers=HEADERS).status_code == 400
+    job_id = upload(client, audio.read_bytes(), 'Wu-Tang Forever - Drake (128k).wav').json['job']['id']
+    assert wait_for(client, job_id, 'awaiting')['hint']['artist'] == 'Wu-Tang Forever'
+    result = client.post(f'/api/jobs/{job_id}/research', json={'artists': rules}, headers=HEADERS)
+    assert result.status_code == 202
+    corrected = wait_for(client, job_id, 'awaiting')
+    assert corrected['hint']['title'] == 'Wu-Tang Forever'
+    assert corrected['hint']['artist'] == 'Drake'
+    query = dict(META, title='Edited title', artist='Edited artist')
+    result = client.post(f'/api/jobs/{job_id}/research', json={'artists': rules, 'metadata': query}, headers=HEADERS)
+    assert result.status_code == 202
+    corrected = wait_for(client, job_id, 'awaiting')
+    assert corrected['hint']['title'] == 'Edited title'
+    assert corrected['hint']['artist'] == 'Edited artist'
+    result = client.post('/api/jobs/upload', data={'file': (io.BytesIO(audio.read_bytes()), 'Wu-Tang Forever - 드레이크 (128k).wav'),
+                                                'artists': json.dumps(rules)}, headers=HEADERS)
+    hint = wait_for(client, result.json['job']['id'], 'awaiting')['hint']
+    assert hint['artist'] == 'Drake' and hint['title'] == 'Wu-Tang Forever'
+    assert client.post(f'/api/jobs/{job_id}/research', json={'artists': {}, 'metadata': query}, headers=HEADERS).status_code == 400
+
+
+def test_manual_cover_upload_preview_and_embedding(app, audio):
+    from PIL import Image
+    client = app.test_client()
+    job_id = upload(client, audio.read_bytes()).json['job']['id']
+    wait_for(client, job_id, 'awaiting')
+    result = client.post(f'/api/jobs/{job_id}/artwork/upload', data={'file': (io.BytesIO(image_bytes()), 'cover.png')}, headers=HEADERS)
+    assert result.status_code == 200
+    assert result.json['job']['artwork']['source'] == '직접 올린 이미지'
+    picture = client.get(f'/api/jobs/{job_id}/cover')
+    assert Image.open(io.BytesIO(picture.data)).format == 'JPEG'
+    assert confirm(client, job_id).status_code == 202
+    ready = wait_for(client, job_id, 'completed')
+    tags = ID3(io.BytesIO(client.get(ready['download']).data))
+    assert tags.getall('APIC') and tags.getall('APIC')[0].mime == 'image/jpeg'
+    assert client.delete(f'/api/jobs/{job_id}/artwork', headers=HEADERS).status_code == 409
+    assert client.post(f'/api/jobs/{job_id}/research', json={'artists': []}, headers=HEADERS).status_code == 409
+
+
+def test_cover_validation_isolation_and_explicit_removal(app, audio):
+    client, stranger = app.test_client(), app.test_client()
+    job_id = upload(client, audio.read_bytes()).json['job']['id']
+    wait_for(client, job_id, 'awaiting')
+    assert stranger.post(f'/api/jobs/{job_id}/artwork/upload', data={'file': (io.BytesIO(image_bytes()), 'cover.png')}, headers=HEADERS).status_code == 404
+    assert client.post(f'/api/jobs/{job_id}/artwork/upload', data={'file': (io.BytesIO(b'bad'), 'cover.png')}, headers=HEADERS).status_code == 400
+    result = client.post(f'/api/jobs/{job_id}/artwork/upload', data={'file': (io.BytesIO(image_bytes()), 'cover.png')}, headers=HEADERS)
+    assert result.status_code == 200
+    assert client.delete(f'/api/jobs/{job_id}/artwork', headers=HEADERS).status_code == 200
+    assert not client.get('/api/jobs').json['jobs'][0]['artwork']['available']
+    confirm(client, job_id)
+    ready = wait_for(client, job_id, 'completed')
+    assert not ID3(io.BytesIO(client.get(ready['download']).data)).getall('APIC')
+
+
+def test_preview_cover_fallback_and_identity_change(app, audio):
+    from PIL import Image
+    data = io.BytesIO()
+    Image.new('RGB', (20, 20), 'green').save(data, 'JPEG')
+    calls = []
+    class CoverNetwork:
+        def search(self, hint):
+            return [Metadata(**META, release_id='first', other_release_ids=('second',))]
+        def cover(self, release_id):
+            calls.append(release_id)
+            return data.getvalue() if release_id == 'second' else None
+    app.extensions['jobs'].network_factory = CoverNetwork
+    client = app.test_client()
+    job_id = upload(client, audio.read_bytes()).json['job']['id']
+    wait_for(client, job_id, 'awaiting')
+    result = client.post(f'/api/jobs/{job_id}/artwork/search', json={'metadata': META, 'candidate': 0}, headers=HEADERS)
+    assert result.status_code == 202
+    ready = wait_for(client, job_id, 'awaiting')
+    assert ready['artwork']['available']
+    assert ready['artwork']['source'] == '같은 앨범의 다른 발매판'
+    assert calls == ['first', 'second']
+    # Editing album identity must detach a previously previewed image.
+    confirm(client, job_id, metadata=dict(META, album='Changed album'))
+    ready = wait_for(client, job_id, 'completed')
+    assert not ID3(io.BytesIO(client.get(ready['download']).data)).getall('APIC')
+    assert calls == ['first', 'second']
+
+
+def test_missing_artwork_is_explained_and_not_retried_implicitly(app, audio):
+    calls = []
+    class MissingCover:
+        def search(self, hint):
+            return [Metadata(**META, release_id='missing')]
+        def cover(self, release_id):
+            calls.append(release_id)
+            return None
+    app.extensions['jobs'].network_factory = MissingCover
+    client = app.test_client()
+    job_id = upload(client, audio.read_bytes()).json['job']['id']
+    wait_for(client, job_id, 'awaiting')
+    client.post(f'/api/jobs/{job_id}/artwork/search', json={'metadata': META, 'candidate': 0}, headers=HEADERS)
+    ready = wait_for(client, job_id, 'awaiting')
+    assert not ready['artwork']['available'] and '커버가 없습니다' in ready['artwork']['message']
+    confirm(client, job_id)
+    ready = wait_for(client, job_id, 'completed')
+    assert '커버가 없습니다' in ready['warning']
+    assert calls == ['missing']
+
+
+def test_artist_aliases_keep_release_link_and_cover(app, audio):
+    import json
+    from PIL import Image
+    stream = io.BytesIO()
+    Image.new('RGB', (20, 20), 'navy').save(stream, 'JPEG')
+    calls = []
+    class AliasNetwork:
+        def search(self, hint):
+            return [Metadata('Song', 'Drake', 'Album', '2024', 'Rock', release_id='release')]
+        def cover(self, release_id):
+            calls.append(release_id)
+            return stream.getvalue()
+    app.extensions['jobs'].network_factory = AliasNetwork
+    client = app.test_client()
+    rules = [{'name': '드레이크', 'aliases': ['Drake']}]
+    response = client.post('/api/jobs/upload', data={'file': (io.BytesIO(audio.read_bytes()), 'Song - Drake.wav'),
+                                                   'artists': json.dumps(rules)}, headers=HEADERS)
+    job_id = response.json['job']['id']
+    ready = wait_for(client, job_id, 'awaiting')
+    assert ready['hint']['artist'] == '드레이크'
+    assert ready['candidates'][0]['artist'] == '드레이크'
+    metadata = dict(META, artist='Drake')
+    response = client.post(f'/api/jobs/{job_id}/artwork/search', json={'metadata': metadata, 'candidate': 0}, headers=HEADERS)
+    assert response.status_code == 202
+    ready = wait_for(client, job_id, 'awaiting')
+    assert ready['artwork']['available'] and calls == ['release']
+    confirm(client, job_id, metadata=metadata)
+    ready = wait_for(client, job_id, 'completed')
+    tags = ID3(io.BytesIO(client.get(ready['download']).data))
+    assert str(tags['TPE1']) == '드레이크'
+    assert tags.getall('APIC') and calls == ['release']

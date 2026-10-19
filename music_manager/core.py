@@ -15,10 +15,13 @@ from urllib.parse import urlparse
 
 import requests
 from mutagen import File
+from mutagen.mp3 import MP3
 from mutagen.id3 import APIC, ID3, TALB, TCON, TDRC, TIT2, TPE1
 from PIL import Image
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+from .artists import canonical_artist, clean_title, filename_hint
 
 
 @dataclass
@@ -31,6 +34,7 @@ class Metadata:
     release_id: str = ""
     score: int = 0
     duration: float | None = None
+    other_release_ids: tuple[str, ...] = ()
 
 
 class MusicBrainzRetry(Retry):
@@ -101,7 +105,7 @@ class Network:
     def search(self, hint: Metadata) -> list[Metadata]:
         def escape(text):
             return re.sub(r'([+\-&|!(){}\[\]^"~*?:\\/])', r'\\\1', text)
-        query = f'recording:"{escape(hint.title)}"'
+        query = f'recording:"{escape(clean_title(hint.title))}"'
         if hint.artist:
             query += f' AND artist:"{escape(hint.artist)}"'
         data = self.json("https://musicbrainz.org/ws/2/recording/",
@@ -111,13 +115,21 @@ class Network:
             artist = ''.join(a.get('name', a.get('artist', {}).get('name', '')) + a.get('joinphrase', '')
                              for a in rec.get('artist-credit', []))
             releases = rec.get("releases", []) or [{}]
-            for release in releases[:3]:
+            releases = sorted(releases, key=lambda r: (
+                bool(hint.album) and r.get('title', '').casefold() != hint.album.casefold(),
+                r.get('release-group', {}).get('primary-type') != 'Album',
+                'Compilation' in r.get('release-group', {}).get('secondary-types', []),
+                r.get('date') or '9999'))
+            for release in releases[:5]:
                 tags = rec.get('tags', [])
                 genre = max(tags, key=lambda t: t.get('count', 0)).get('name', '') if tags else ''
                 results.append(Metadata(rec.get('title', ''), artist, release.get('title', ''),
-                                        release.get('date', rec.get('first-release-date', ''))[:4],
+                                        (release.get('date') or rec.get('first-release-date') or '')[:4],
                                         genre, release.get('id', ''), int(rec.get('score', 0)),
-                                        rec['length'] / 1000 if rec.get('length') else None))
+                                        rec['length'] / 1000 if rec.get('length') else None,
+                                        tuple(r['id'] for r in releases if r.get('id') != release.get('id')
+                                              and r.get('id') and release.get('release-group', {}).get('id')
+                                              and r.get('release-group', {}).get('id') == release['release-group']['id'])[:3]))
         return results
 
     def cover(self, release_id: str) -> bytes | None:
@@ -140,10 +152,9 @@ class Network:
                 return output.getvalue()
 
 
-def read_hint(path: Path) -> Metadata:
-    hint = Metadata(title=path.stem)
-    if ' - ' in path.stem:
-        hint.artist, hint.title = path.stem.split(' - ', 1)
+def read_hint(path: Path, artists=()) -> Metadata:
+    artist, title = filename_hint(path.stem, artists)
+    hint = Metadata(title=title, artist=artist)
     try:
         audio = File(path, easy=True)
         if audio is not None:
@@ -163,6 +174,7 @@ def read_hint(path: Path) -> Metadata:
             hint.duration = audio.info.length
     except Exception:
         pass  # FFmpeg supplies the definitive validation for unrecognized inputs.
+    hint.artist = canonical_artist(hint.artist, artists)
     return hint
 
 
@@ -184,7 +196,8 @@ def confirm_metadata(values: dict[str, str], selected: Metadata) -> Metadata:
     if values['year'] and not re.fullmatch(r'[0-9]{4}', values['year']):
         raise ValueError('발매 연도는 네 자리 숫자로 입력하세요.')
     same_release = same_identity(Metadata(**values), selected)
-    return Metadata(**values, release_id=selected.release_id if same_release else '')
+    return Metadata(**values, release_id=selected.release_id if same_release else '',
+                    other_release_ids=selected.other_release_ids if same_release else ())
 
 
 def same_identity(first: Metadata, second: Metadata) -> bool:
@@ -333,9 +346,14 @@ class Library:
         with tempfile.TemporaryDirectory(dir=self.output) as folder:
             progress(0.4)
             converted = Path(folder) / 'converted.mp3'
+            try:
+                already_mp3 = isinstance(File(source), MP3)
+            except Exception:
+                already_mp3 = False
+            codec = ['-c:a', 'copy'] if already_mp3 else ['-c:a', 'libmp3lame', '-q:a', '2']
             self._run([ffmpeg, '-nostdin', '-v', 'error', '-protocol_whitelist', 'file,pipe',
-                       '-i', str(source), '-map', '0:a:0',
-                       '-vn', '-map_metadata', '-1', '-c:a', 'libmp3lame', '-q:a', '2', str(converted)])
+                       '-i', str(source), '-map', '0:a:0', '-vn', '-map_metadata', '-1',
+                       *codec, str(converted)])
             write_tags(converted, meta, cover)
             # Also recognize a generated MP3 if the user imports it later.
             output_key = self._fingerprint(converted, ffmpeg)
