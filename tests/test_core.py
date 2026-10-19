@@ -1,0 +1,290 @@
+import io
+import json
+import shutil
+import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import pytest
+from mutagen.id3 import ID3
+from PIL import Image
+
+from music_manager.core import Library, Metadata, Network, confirm_metadata, read_hint, safe_name, write_tags
+
+
+@pytest.fixture
+def wav(tmp_path):
+    if not shutil.which('ffmpeg'):
+        pytest.skip('FFmpeg is required for audio integration tests')
+    path = tmp_path / 'Artist - Song.wav'
+    subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i',
+                    'sine=frequency=440:duration=0.3', str(path)], check=True)
+    return path
+
+
+def cover():
+    out = io.BytesIO()
+    Image.new('RGB', (32, 32), 'blue').save(out, 'JPEG')
+    return out.getvalue()
+
+
+def test_conversion_tags_cover_and_duplicate(tmp_path, wav):
+    library = Library(tmp_path / 'out')
+    meta = Metadata('노래', '가수', '앨범', '2024', 'Rock')
+    path, duplicate = library.process(wav, meta, cover())
+    assert not duplicate
+    assert path.name == '가수 - 노래.mp3'
+    tags = ID3(path)
+    assert tags.version == (2, 3, 0)
+    assert str(tags['TIT2']) == '노래'
+    assert str(tags['TPE1']) == '가수'
+    assert str(tags['TALB']) == '앨범'
+    assert str(tags['TDRC']) == '2024'
+    assert str(tags['TCON']) == 'Rock'
+    assert tags.getall('APIC')[0].data == cover()
+    assert read_hint(path).duration > 0
+    # The duplicate index survives a new process / Library instance.
+    second, duplicate = Library(library.output).process(wav, Metadata('Other', 'Other'))
+    assert duplicate and second == path
+    assert len(list(library.output.glob('*.mp3'))) == 1
+
+
+def test_collision_and_original_preservation(tmp_path, wav):
+    output = tmp_path / 'out'
+    output.mkdir()
+    existing = output / 'Artist - Song.mp3'
+    existing.write_bytes(b'existing user file')
+    original = wav.read_bytes()
+    path, _ = Library(output).process(wav, Metadata('Song', 'Artist'))
+    assert path.name == 'Artist - Song (2).mp3'
+    assert existing.read_bytes() == b'existing user file'
+    assert wav.read_bytes() == original
+
+
+def test_bad_audio_does_not_publish(tmp_path):
+    bad = tmp_path / 'bad.wav'
+    bad.write_text('not audio')
+    library = Library(tmp_path / 'out')
+    with pytest.raises(RuntimeError, match='FFmpeg'):
+        library.process(bad, Metadata('Song', 'Artist'))
+    # Only the persistent OS lock file may remain after a failed operation.
+    assert {p.name for p in library.output.iterdir()} == {'.id3-sit.lock'}
+
+
+def test_required_fields(tmp_path):
+    with pytest.raises(ValueError, match='필수'):
+        Library(tmp_path).process(tmp_path / 'missing', Metadata())
+
+
+@pytest.mark.parametrize('text', ['../hello', 'a:b/c\\d', 'CON', 'NUL', '  ...'])
+def test_safe_names(text):
+    name = safe_name(text)
+    assert name and '/' not in name and '\\' not in name and ':' not in name
+    assert not name.endswith(('.', ' '))
+    assert name.upper() not in {'CON', 'NUL'}
+
+
+@pytest.mark.parametrize('url', ['https://youtube.com/watch?v=x', 'https://youtu.be/x',
+                                  'https://x.googlevideo.com/a', 'file:///tmp/a',
+                                  'https://user:password@example.com/a'])
+def test_unsupported_urls(url, tmp_path):
+    with pytest.raises(ValueError):
+        Network().download(url, tmp_path / 'file')
+
+
+@pytest.fixture
+def server():
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == '/missing':
+                self.send_error(404)
+                return
+            body = b'<html>page</html>' if self.path == '/page' else b'RIFF audio bytes'
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html' if self.path == '/page' else 'audio/wav')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass
+    httpd = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    yield f'http://127.0.0.1:{httpd.server_port}'
+    httpd.shutdown()
+    thread.join()
+    httpd.server_close()
+
+
+def test_download_validation_and_recovery(server, tmp_path):
+    network = Network()
+    with pytest.raises(ValueError, match='웹페이지'):
+        network.download(server + '/page', tmp_path / 'page')
+    with pytest.raises(Exception):
+        network.download(server + '/missing', tmp_path / 'missing')
+    with pytest.raises(ValueError, match='크기'):
+        network.download(server + '/audio', tmp_path / 'big', limit=2)
+    target = tmp_path / 'good'
+    network.download(server + '/audio', target)
+    assert target.read_bytes() == b'RIFF audio bytes'
+
+
+def test_search_preserves_alternative_releases(monkeypatch):
+    network = Network()
+    captured = []
+    def fake_json(url, params):
+        captured.append(params)
+        return {'recordings': [{'title': 'Song', 'score': '98', 'length': 180000,
+                               'artist-credit': [{'name': 'Artist'}],
+                               'releases': [{'id': 'a', 'title': 'Album', 'date': '2020-01-01'},
+                                            {'id': 'b', 'title': 'Compilation'}]}]}
+    monkeypatch.setattr(network, 'json', fake_json)
+    results = network.search(Metadata('Song', 'Artist'))
+    assert len(results) == 2
+    assert results[0].year == '2020'
+    assert results[0].duration == 180
+    assert results[0].artist == 'Artist'
+    assert 'artist:' in captured[0]['query']
+
+
+def test_cover_validation(monkeypatch):
+    network = Network()
+    def download(url, path, **kwargs):
+        path.write_bytes(cover())
+    monkeypatch.setattr(network, 'download', download)
+    image = network.cover('12345678-1234-1234-1234-123456789012')
+    assert Image.open(io.BytesIO(image)).format == 'JPEG'
+    assert network.cover('../unsafe') is None
+
+
+def test_retry_policy_and_timeouts():
+    network = Network()
+    policy = network.http.get_adapter('https://').max_retries
+    assert policy.total == 3
+    assert 429 in policy.status_forcelist
+    assert policy.allowed_methods == ['GET']
+
+
+
+
+def test_long_unicode_filename_and_reserved_windows_names(tmp_path, wav):
+    library = Library(tmp_path / 'out')
+    target, _ = library.process(wav, Metadata('노래' * 100, '가수' * 100))
+    assert len(target.name.encode('utf-8')) <= 220
+    assert str(ID3(target)['TIT2']) == '노래' * 100
+    assert safe_name('CON.txt') == '_CON.txt'
+    assert safe_name('LPT1.data') == '_LPT1.data'
+    assert safe_name('😀' * 200).encode('utf-8').decode('utf-8')
+
+
+@pytest.mark.parametrize('contents', ['[]', '{broken', '{"bad-key":"song.mp3"}',
+                                      '{"' + 'a' * 64 + '": "../song.mp3"}'])
+def test_invalid_index_is_preserved_with_actionable_error(tmp_path, contents):
+    index = tmp_path / '.id3-sit-index.json'
+    index.write_text(contents, encoding='utf-8')
+    with pytest.raises(RuntimeError, match='인덱스가 손상'):
+        Library(tmp_path)
+    assert index.read_text(encoding='utf-8') == contents
+
+
+def test_index_utf8_and_rollback_on_disk_error(tmp_path, wav, monkeypatch):
+    import os
+    library = Library(tmp_path / 'out')
+    target, _ = library.process(wav, Metadata('노래', '가수'))
+    index_before = library.index_path.read_bytes()
+    assert '가수' in index_before.decode('utf-8')
+    index_state = dict(library.index)
+    # Remove only this test's generated output to force a fresh publication.
+    target.unlink()
+    real_replace = os.replace
+
+    def fail_index(source, destination):
+        if destination == library.index_path:
+            raise OSError('simulated disk failure')
+        return real_replace(source, destination)
+    monkeypatch.setattr(os, 'replace', fail_index)
+    with pytest.raises(OSError, match='disk failure'):
+        library.process(wav, Metadata('New title', 'New artist'))
+    assert library.index_path.read_bytes() == index_before
+    assert library.index == index_state
+    assert not list(library.output.glob('*.mp3'))
+    assert not list(library.output.glob('*.tmp'))
+    monkeypatch.setattr(os, 'replace', real_replace)
+    result, duplicate = library.process(wav, Metadata('New title', 'New artist'))
+    assert result.is_file() and not duplicate
+
+
+def test_instances_refresh_index_and_lock_output(tmp_path, wav):
+    library = Library(tmp_path / 'out')
+    other = Library(library.output)
+    with library._locked():
+        with pytest.raises(RuntimeError, match='사용 중'):
+            other.process(wav, Metadata('Song', 'Artist'))
+    result, _ = library.process(wav, Metadata('Song', 'Artist'))
+    target, duplicate = other.process(wav, Metadata('Other name', 'Other artist'))
+    assert duplicate and target == result
+    assert len(list(library.output.glob('*.mp3'))) == 1
+
+
+def test_generated_mp3_reimport_is_duplicate(tmp_path, wav):
+    library = Library(tmp_path / 'out')
+    target, _ = library.process(wav, Metadata('Song', 'Artist'))
+    output, duplicate = library.process(target, Metadata('Other title', 'Artist'))
+    assert duplicate and output == target
+    assert len(list(library.output.glob('*.mp3'))) == 1
+
+
+def test_tagless_audio_duration_and_date_hint(tmp_path, wav):
+    assert read_hint(wav).duration == pytest.approx(.3, abs=.02)
+    target, _ = Library(tmp_path / 'out').process(wav, Metadata('Song', 'Artist', year='2024-03-01'))
+    assert read_hint(target).year == '2024'
+
+
+def test_edited_release_identity_drops_stale_cover():
+    from dataclasses import asdict
+    candidate = Metadata('Song', 'Artist', 'Album', '2024', 'Rock', 'release-id')
+    values = {key: asdict(candidate)[key] for key in ('title', 'artist', 'album', 'year', 'genre')}
+    assert confirm_metadata(values, candidate).release_id == 'release-id'
+    assert confirm_metadata(dict(values, genre='Pop'), candidate).release_id == 'release-id'
+    for field in ('title', 'artist', 'album', 'year'):
+        assert confirm_metadata(dict(values, **{field: '2025' if field == 'year' else 'Changed'}), candidate).release_id == ''
+    for invalid in ('２０２４', '2024-03', 'abcd'):
+        with pytest.raises(ValueError, match='네 자리'):
+            confirm_metadata(dict(values, year=invalid), candidate)
+
+
+def test_musicbrainz_first_retry_is_rate_limited():
+    retry = Network().http.get_adapter('https://musicbrainz.org/').max_retries
+    retry = retry.increment(method='GET', error=ConnectionError('offline'))
+    assert retry.get_backoff_time() >= 1.1
+
+
+def test_ffmpeg_does_not_follow_network_playlists(tmp_path, server):
+    playlist = tmp_path / 'audio.m3u8'
+    playlist.write_text('#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n' +
+                        server + '/audio.ts\n#EXT-X-ENDLIST\n', encoding='utf-8')
+    library = Library(tmp_path / 'out')
+    with pytest.raises(RuntimeError, match='not on whitelist'):
+        library.process(playlist, Metadata('Song', 'Artist'))
+    assert not list(library.output.glob('*.mp3'))
+
+
+
+
+def test_wav_id3_hints_and_embedded_art(wav):
+    from mutagen.wave import WAVE
+    from mutagen.id3 import APIC, TALB, TDRC, TIT2, TPE1
+    from music_manager.core import read_embedded_cover
+    audio = WAVE(wav)
+    audio.add_tags()
+    audio.tags.add(TIT2(encoding=1, text='Tagged title'))
+    audio.tags.add(TPE1(encoding=1, text='Tagged artist'))
+    audio.tags.add(TALB(encoding=1, text='Tagged album'))
+    audio.tags.add(TDRC(encoding=1, text='2023-04-05'))
+    audio.tags.add(APIC(encoding=1, mime='image/jpeg', type=3, data=cover()))
+    audio.save()
+    hint = read_hint(wav)
+    assert (hint.title, hint.artist, hint.album, hint.year) == ('Tagged title', 'Tagged artist', 'Tagged album', '2023')
+    assert Image.open(io.BytesIO(read_embedded_cover(wav))).size == (32, 32)

@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: id3-sit-web
+    runtime: docker
+    plan: free
+    region: singapore
+    healthCheckPath: /healthz
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: "10000"
+      - key: ID3_HTTPS
+        value: "true"
+      - key: ID3_WEB_SECRET
+        generateValue: true
+      - key: ID3_WEB_PASSWORD
+        generateValue: true
+      - key: ID3_DOWNLOAD_HOSTS
+        value: archive.org,*.archive.org,upload.wikimedia.org
