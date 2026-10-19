@@ -47,12 +47,12 @@ function render() {
     const status=node('td');status.append(node('span','status-badge '+job.status,(job.status==='completed'?'✓ ':'')+statusLabels[job.status]));
     if(['queued','searching','converting','covering'].includes(job.status)){const wrap=node('div','job-progress');const progress=node('progress');progress.max=1;progress.value=job.progress;progress.setAttribute('aria-label','처리 진행률');wrap.append(progress);status.append(wrap);}
     if(job.error)status.append(node('div','job-error',job.error));
-    if(job.duplicate)status.append(node('div','duplicate-note','중복 저장 방지됨'));
+    if(job.duplicate)status.append(node('div','duplicate-note','중복 저장 방지됨 · 태그 갱신'));
     if(job.warning && job.status==='completed')status.append(node('div','job-error',job.warning));
     row.append(status);
     const actions=node('td');
     if(job.status==='awaiting')actions.append(action('정보 확인 →',()=>edit(job.id)));
-    if(job.status==='completed'){const a=node('a','row-button download','다운로드 ↓');a.href=job.download;a.setAttribute('download','');actions.append(a);}
+    if(job.status==='completed'){const a=node('a','row-button download','다운로드 ↓');a.href=job.download;a.setAttribute('download','');actions.append(a,action('정보 수정',()=>reopen(job.id)));}
     if(job.status==='failed')actions.append(action('재시도 ↻',()=>mutate(`/api/jobs/${job.id}/retry`,{method:'POST',body:JSON.stringify({artists:ArtistLibrary.rules()})})));
     if(!['queued','searching','converting','covering'].includes(job.status)){const remove=action('×',()=>removeJob(job),'remove-job');remove.setAttribute('aria-label',job.name+' 삭제');actions.append(remove);}
     row.append(actions);rows.push(row);
@@ -67,7 +67,7 @@ function render() {
 async function refresh() {
   if(state.loading)return;
   state.loading=true;
-  try {const data=await api('/api/jobs');state.jobs=data.jobs;state.allowed=data.allowed_hosts;$('#allowed-hosts').textContent='허용 호스트: '+(state.allowed.join(', ')||'없음 · 파일 업로드를 이용해 주세요.');render();}
+  try {const data=await api('/api/jobs');state.jobs=data.jobs;state.allowed=data.allowed_hosts;$('#app-version').textContent=`ID3 Sit Web · v${data.version||'0.2.0'}`;$('#app-version').title=data.revision?`배포 버전 ${data.revision}`:'';$('#allowed-hosts').textContent='허용 호스트: '+(state.allowed.join(', ')||'없음 · 파일 업로드를 이용해 주세요.');render();}
   catch(error){if(!$('#login-dialog').open)toast(error.message);}
   finally{state.loading=false;}
 }
@@ -113,7 +113,7 @@ function fillMetadata(meta,index){
 function renderCandidates(job){
   const candidates=$('#candidates');candidates.replaceChildren();
   job.candidates.forEach((meta,i)=>{const button=node('button','candidate');button.append(node('strong','',`${meta.artist} — ${meta.title}`),node('small','',`${meta.album||'앨범 정보 없음'} · ${meta.year||'연도 미상'} · ${meta.duration?meta.duration.toFixed(1)+'초':'길이 미상'} · 검색 점수 ${meta.score}`));button.addEventListener('click',()=>{fillMetadata(meta,i);if(meta.release_id)findCover();});candidates.append(button);});
-  if(!job.candidates.length)candidates.append(node('p','no-candidates','검색 결과가 없습니다. 아래에서 정보를 직접 입력할 수 있어요.'));
+  if(!job.candidates.length)candidates.append(node('p','no-candidates',job.search_failed?'온라인 검색을 완료하지 못했습니다. 다시 검색하거나 아래에 직접 입력하세요.':'일치하는 결과가 없습니다. 제목과 가수를 고쳐 다시 검색할 수 있어요.'));
 }
 function edit(id){
   const job=state.jobs.find(j=>j.id===id);if(!job||job.status!=='awaiting')return;
@@ -174,6 +174,13 @@ async function research(byFields){
   warning('#form-error','');
   try{const data=await api(`/api/jobs/${job.id}/research`,{method:'POST',body:JSON.stringify(body)});if(state.editing?.id===job.id){state.researching=job.id;state.candidate=null;}acceptJob(data.job);await refresh();}
   catch(error){warning('#form-error',error.message);}
+}
+async function reopen(id){
+  try{
+    const job=state.jobs.find(item=>item.id===id);
+    const data=await api(`/api/jobs/${id}/research`,{method:'POST',body:JSON.stringify({artists:ArtistLibrary.rules(),metadata:job.metadata})});
+    acceptJob(data.job);toast('곡 정보를 다시 검색합니다. 정보 확인 버튼에서 수정해 주세요.');
+  }catch(error){toast(error.message);}
 }
 async function findCover(){
   if(!state.editing)return;

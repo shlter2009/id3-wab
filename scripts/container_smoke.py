@@ -11,16 +11,22 @@ from mutagen.id3 import ID3
 from music_manager.core import Library, Metadata
 assert os.getuid() == 10001
 with urllib.request.urlopen('http://127.0.0.1:8000/healthz') as response:
-    assert json.load(response)['ffmpeg']
+    health=json.load(response)
+    assert health['ffmpeg'] and health['version'] == '0.2.0'
 with urllib.request.urlopen('http://127.0.0.1:8000/') as response:
     assert '음악에 정보를 입히다' in response.read().decode()
 with tempfile.TemporaryDirectory() as folder:
     root=Path(folder); audio=root/'sample.wav'
     subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','sine=frequency=440:duration=0.2',str(audio)],check=True)
-    target, duplicate=Library(root/'out').process(audio,Metadata('컨테이너 검증','ID3 Sit'))
+    library=Library(root/'out')
+    target, duplicate=library.process(audio,Metadata('컨테이너 검증 256k','ID3 Sit (128k)'))
     assert target.is_file() and not duplicate
     assert ID3(target).version == (2,3,0)
-print('Non-root container, packaged website, health endpoint, FFmpeg and ID3 tagging passed')
+    assert str(ID3(target)['TIT2']) == '컨테이너 검증'
+    updated, duplicate=library.process(audio,Metadata('수정곡','ID3 Sit'),update_duplicate=True)
+    assert duplicate and not target.exists() and updated.name == 'ID3 Sit - 수정곡.mp3'
+    assert len(list((root/'out').glob('*.mp3'))) == 1
+print('Non-root v0.2.0 container, website, FFmpeg, quality cleanup and duplicate retagging passed')
 '''
 
 

@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
@@ -21,7 +21,7 @@ from PIL import Image
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from .artists import canonical_artist, clean_title, filename_hint
+from .artists import canonical_artist, clean_title, filename_hint, search_key
 
 
 @dataclass
@@ -35,6 +35,7 @@ class Metadata:
     score: int = 0
     duration: float | None = None
     other_release_ids: tuple[str, ...] = ()
+    release_group_id: str = ''
 
 
 class MusicBrainzRetry(Retry):
@@ -52,7 +53,7 @@ def session() -> requests.Session:
     s.mount("https://musicbrainz.org/", HTTPAdapter(max_retries=MusicBrainzRetry(
         total=3, backoff_factor=0.7, status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"], respect_retry_after_header=False)))
-    s.headers["User-Agent"] = "ID3Sit/0.1 (https://github.com/shlter2009/id3-sit)"
+    s.headers["User-Agent"] = "ID3SitWeb/0.2 (https://github.com/shlter2009/id3-wab)"
     return s
 
 
@@ -103,9 +104,52 @@ class Network:
                 raise ValueError("빈 파일입니다.")
 
     def search(self, hint: Metadata) -> list[Metadata]:
+        """Try both filename orders before a bounded, title-only fallback.
+
+        These are suggestions for user confirmation, never automatic matches.
+        Scores from different MusicBrainz queries aren't directly comparable.
+        """
+        hint = replace(hint, title=clean_title(hint.title), artist=clean_title(hint.artist))
+        if not hint.title:
+            return []
+        direct = self._search_recordings(hint)
+        def exact(candidate, query):
+            return (search_key(candidate.title) == search_key(query.title) and
+                    (not query.artist or search_key(candidate.artist) == search_key(query.artist)))
+        if any(exact(candidate, hint) for candidate in direct):
+            return self._rank(direct, hint)
+        results = list(direct)
+        if hint.artist and search_key(hint.artist) != search_key(hint.title):
+            reverse = replace(hint, title=hint.artist, artist=hint.title)
+            swapped = self._search_recordings(reverse)
+            if any(exact(candidate, reverse) for candidate in swapped):
+                return self._rank(swapped, reverse)
+            results.extend(swapped)
+        titles = list(dict.fromkeys(filter(None, (hint.title, hint.artist))))
+        # The artist part may itself be a title in a reversed filename.
+        results.extend(self._search_recordings(replace(hint, artist=''), titles=titles))
+        title_keys = {search_key(title) for title in titles}
+        relevant = [candidate for candidate in results if search_key(candidate.title) in title_keys]
+        unique = {}
+        for candidate in relevant:
+            key = (search_key(candidate.title), search_key(candidate.artist), candidate.release_id,
+                   candidate.album, candidate.year)
+            unique.setdefault(key, candidate)
+        return self._rank(list(unique.values()), hint)[:30]
+
+    @staticmethod
+    def _rank(candidates, hint):
+        return sorted(candidates, key=lambda candidate: (
+            search_key(candidate.title) != search_key(hint.title),
+            bool(hint.artist) and search_key(candidate.artist) != search_key(hint.artist),
+            (abs(candidate.duration - hint.duration) if candidate.duration is not None
+             and hint.duration is not None else float('inf')),
+            -candidate.score))
+
+    def _search_recordings(self, hint, titles=None):
         def escape(text):
             return re.sub(r'([+\-&|!(){}\[\]^"~*?:\\/])', r'\\\1', text)
-        query = f'recording:"{escape(clean_title(hint.title))}"'
+        query = ' OR '.join(f'recording:"{escape(title)}"' for title in (titles or [hint.title]))
         if hint.artist:
             query += f' AND artist:"{escape(hint.artist)}"'
         data = self.json("https://musicbrainz.org/ws/2/recording/",
@@ -129,16 +173,23 @@ class Network:
                                         rec['length'] / 1000 if rec.get('length') else None,
                                         tuple(r['id'] for r in releases if r.get('id') != release.get('id')
                                               and r.get('id') and release.get('release-group', {}).get('id')
-                                              and r.get('release-group', {}).get('id') == release['release-group']['id'])[:3]))
+                                              and r.get('release-group', {}).get('id') == release['release-group']['id'])[:3],
+                                        release.get('release-group', {}).get('id', '')))
         return results
 
     def cover(self, release_id: str) -> bytes | None:
-        if not re.fullmatch(r'[0-9a-fA-F-]{36}', release_id):
+        return self._cover('release', release_id)
+
+    def cover_group(self, group_id: str) -> bytes | None:
+        return self._cover('release-group', group_id)
+
+    def _cover(self, entity: str, entity_id: str) -> bytes | None:
+        if not re.fullmatch(r'[0-9a-fA-F-]{36}', entity_id):
             return None
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'cover'
             try:
-                self.download(f'https://coverartarchive.org/release/{release_id}/front-500',
+                self.download(f'https://coverartarchive.org/{entity}/{entity_id}/front-500',
                               path, limit=10 * 1024 * 1024, audio=False)
             except requests.HTTPError as exc:
                 if exc.response is not None and exc.response.status_code == 404:
@@ -174,7 +225,8 @@ def read_hint(path: Path, artists=()) -> Metadata:
             hint.duration = audio.info.length
     except Exception:
         pass  # FFmpeg supplies the definitive validation for unrecognized inputs.
-    hint.artist = canonical_artist(hint.artist, artists)
+    hint.title = clean_title(hint.title) or title
+    hint.artist = canonical_artist(clean_title(hint.artist) or artist, artists)
     return hint
 
 
@@ -190,18 +242,23 @@ def safe_name(value: str) -> str:
 
 def confirm_metadata(values: dict[str, str], selected: Metadata) -> Metadata:
     """Detach a release's cover if the user changes its identifying fields."""
-    values = {key: value.strip() for key, value in values.items()}
+    values = {key: clean_title(value) if key in {'title', 'artist'} else value.strip()
+              for key, value in values.items()}
     if not values['title'] or not values['artist']:
         raise ValueError('제목과 아티스트를 입력하세요.')
     if values['year'] and not re.fullmatch(r'[0-9]{4}', values['year']):
         raise ValueError('발매 연도는 네 자리 숫자로 입력하세요.')
     same_release = same_identity(Metadata(**values), selected)
     return Metadata(**values, release_id=selected.release_id if same_release else '',
-                    other_release_ids=selected.other_release_ids if same_release else ())
+                    other_release_ids=selected.other_release_ids if same_release else (),
+                    release_group_id=selected.release_group_id if same_release else '')
 
 
 def same_identity(first: Metadata, second: Metadata) -> bool:
-    return all(getattr(first, key).strip().casefold() == getattr(second, key).strip().casefold()
+    def normalized(metadata, key):
+        value = getattr(metadata, key)
+        return (clean_title(value) if key in {'title', 'artist'} else value).strip().casefold()
+    return all(normalized(first, key) == normalized(second, key)
                for key in ('title', 'artist', 'album', 'year'))
 
 
@@ -256,6 +313,7 @@ class Library:
         output.mkdir(parents=True, exist_ok=True)
         self.index_path = output / '.id3-sit-index.json'
         self.index = self._load_index()
+        self.updated_from: Path | None = None
 
     def _load_index(self):
         if not self.index_path.exists():
@@ -315,16 +373,19 @@ class Library:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
 
-    def process(self, source: Path, meta: Metadata, cover=None, progress=lambda p: None):
+    def process(self, source: Path, meta: Metadata, cover=None, progress=lambda p: None,
+                *, update_duplicate=False):
+        meta = replace(meta, title=clean_title(meta.title), artist=clean_title(meta.artist))
         if not meta.title.strip() or not meta.artist.strip():
             raise ValueError('제목과 아티스트는 필수입니다.')
         ffmpeg = shutil.which('ffmpeg')
         if not ffmpeg:
             raise RuntimeError('FFmpeg를 찾을 수 없습니다. 설치 후 PATH를 확인하세요.')
         with self._locked():
+            self.updated_from = None
             # Another instance may have updated the index since construction.
             self.index = self._load_index()
-            return self._process(source.resolve(), meta, cover, progress, ffmpeg)
+            return self._process(source.resolve(), meta, cover, progress, ffmpeg, update_duplicate)
 
     def _fingerprint(self, source: Path, ffmpeg: str):
         # Let FFmpeg hash decoded PCM as a stream; no large PCM temp file is needed.
@@ -337,12 +398,17 @@ class Library:
             raise RuntimeError('FFmpeg 오디오 지문을 읽을 수 없습니다.')
         return match.group(1)
 
-    def _process(self, source, meta, cover, progress, ffmpeg):
+    def _process(self, source, meta, cover, progress, ffmpeg, update_duplicate=False):
         key = self._fingerprint(source, ffmpeg)
         known = self.index.get(key)
-        if known and (self.output / known).is_file():
-            progress(1)
-            return self.output / known, True
+        previous = self.output / known if known and (self.output / known).is_file() else None
+        if previous:
+            if not update_duplicate:
+                progress(1)
+                return previous, True
+            # Retag the existing MP3 so repeated imports do not undo corrections
+            # or encode the same audio a second time.
+            source = previous
         with tempfile.TemporaryDirectory(dir=self.output) as folder:
             progress(0.4)
             converted = Path(folder) / 'converted.mp3'
@@ -359,9 +425,12 @@ class Library:
             output_key = self._fingerprint(converted, ffmpeg)
             progress(0.9)
             stem = f'{safe_name(meta.artist)} - {safe_name(meta.title)}'
+            backup = Path(folder) / 'previous.mp3'
+            if previous:
+                shutil.copyfile(previous, backup)
             target = self.output / f'{stem}.mp3'
             n = 2
-            while True:
+            while target != previous:
                 try:
                     # Exclusive reservation avoids overwriting an existing track.
                     with target.open('xb'):
@@ -372,15 +441,22 @@ class Library:
                     n += 1
             try:
                 os.replace(converted, target)
-                updated = dict(self.index)
+                updated = {k: target.name if value == known and previous else value
+                           for k, value in self.index.items()}
                 updated[key] = updated[output_key] = target.name
                 self._save_index(updated)
             except Exception:
-                target.unlink(missing_ok=True)
+                if previous and target == previous:
+                    os.replace(backup, previous)
+                else:
+                    target.unlink(missing_ok=True)
                 raise
+            if previous and previous != target:
+                previous.unlink()
+            self.updated_from = previous
             self.index = updated
             progress(1)
-            return target, False
+            return target, bool(previous)
 
     @staticmethod
     def _run(args):

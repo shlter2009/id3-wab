@@ -39,12 +39,28 @@ def validate_artists(value) -> list[dict]:
     return output
 
 
-# Strip only technical quality annotations; live/remix/featured credits are identity.
-QUALITY = re.compile(r'\s*[\[(]\s*(?:\d{2,4}\s*k(?:bps)?|\d{2,3}\s*kb/s|\d{2}\s*bit|\d{2,3}(?:\.\d+)?\s*khz)\s*[\])]\s*', re.I)
+# Recognize technical units, never bare numbers or version/featured credits.
+QUALITY_UNIT = r'(?:\d{2,4}\s*(?:kbps|kb/s|kbits?/s|k)|(?:8|16|24|32)\s*bit|\d{2,3}(?:\.\d+)?\s*khz)'
+QUALITY_GROUP = re.compile(r'[\[(]\s*' + QUALITY_UNIT +
+                           r'(?:[\s,;/+_-]+' + QUALITY_UNIT + r')*\s*[\])]', re.I)
+# Bare "24K Magic" and "100K" can be real titles. A bare k suffix is
+# removed only for common audio bitrates; explicit kbps units are unambiguous.
+BITRATES = r'(?:32|40|48|56|64|80|96|112|128|144|160|192|224|256|288|320|384|448|512|640|768|1024|1411|1536)'
+BARE_QUALITY = (r'(?:\d{2,4}\s*(?:kbps|kb/s|kbits?/s)|' + BITRATES +
+                r'\s*k|(?:8|16|24|32)\s*bit|\d{2,3}(?:\.\d+)?\s*khz)')
+QUALITY = re.compile(r'(?<![^\W_])' + BARE_QUALITY + r'(?![^\W_])', re.I)
 
 
 def clean_title(value: str) -> str:
-    return re.sub(r'\s+', ' ', QUALITY.sub(' ', value)).strip()
+    text = unicodedata.normalize('NFKC', value)
+    text = QUALITY.sub(' ', QUALITY_GROUP.sub(' ', text))
+    text = re.sub(r'\(\s*\)|\[\s*\]', ' ', text)
+    return re.sub(r'\s+', ' ', text).strip(' \t\r\n_-–—|,;/')
+
+
+def search_key(value: str) -> str:
+    """Compare spelling/punctuation without erasing live/remix identity."""
+    return ' '.join(re.findall(r'[^\W_]+', identity(clean_title(value))))
 
 
 def filename_hint(stem: str, artists=()) -> tuple[str, str]:

@@ -40,3 +40,25 @@ def test_dictionary_validation_and_unicode_names():
 def test_preserve_version_and_clean_only_quality():
     assert clean_title('Song (Live) [128kbps] (Remix)') == 'Song (Live) (Remix)'
     assert clean_title('Song (Part 2)') == 'Song (Part 2)'
+
+
+@pytest.mark.parametrize('text,expected', [
+    ('Wu-Tang Forever 128k', 'Wu-Tang Forever'),
+    ('Wu-Tang Forever - Drake 256k', 'Wu-Tang Forever - Drake'),
+    ('Song (128k) [256kbps]', 'Song'),
+    ('Song (256 kb/s)', 'Song'),
+    ('Song [256kbps / 44.1kHz]', 'Song'),
+    ('Song - 256K', 'Song'),
+    ('Song_256k', 'Song'),
+    ('Song （２５６ｋ）', 'Song'),
+    ('Song (Live) 128k (Remix feat. Artist)', 'Song (Live) (Remix feat. Artist)'),
+    ('Song 128 256 (Part 2)', 'Song 128 256 (Part 2)'),
+    ('128king - K256', '128king - K256'),
+    ('Blink-182 - 18 and Life', 'Blink-182 - 18 and Life'),
+    ('24K Magic', '24K Magic'),
+    ('100K (Remix)', '100K (Remix)'),
+    ('Song 128k / 256k', 'Song'),
+])
+def test_quality_markers_with_or_without_brackets(text, expected):
+    assert clean_title(text) == expected
+    assert clean_title(clean_title(text)) == expected

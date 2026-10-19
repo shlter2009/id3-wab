@@ -26,6 +26,8 @@ def main():
         Image.new('RGB', (40, 40), 'navy').save(cover_image, 'JPEG')
         manual_image = root / 'manual-cover.png'
         Image.new('RGB', (80, 80), 'red').save(manual_image)
+        latest_image = root / 'updated-cover.png'
+        Image.new('RGB', (80, 80), 'green').save(latest_image)
         class DemoNetwork:
             def search(self, hint):
                 return [Metadata(hint.title, hint.artist, 'Sessions', '2024', 'Electronic',
@@ -82,6 +84,7 @@ def main():
                     page.get_by_role('button', name='정보 확인 →').first.click(timeout=15000)
                     assert page.locator('#metadata-form input[name=artist]').input_value() == 'Studio'
                     assert page.locator('#metadata-form input[name=title]').input_value() == 'Sample'
+                    assert '128k' not in page.locator('#source-description').inner_text()
                     page.locator('.candidate').first.click()
                     page.locator('#cover-preview').wait_for(state='visible')
                     page.locator('#metadata-form input[name=title]').fill('검증곡')
@@ -91,6 +94,11 @@ def main():
                         page.locator('.candidate').first.click()
                         page.locator('#cover-preview').wait_for(state='visible')
                         page.locator('#cover-file').set_input_files(str(manual_image))
+                        page.get_by_text('직접 올린 이미지', exact=True).wait_for()
+                    else:
+                        page.locator('#metadata-form input[name=title]').fill('검증곡 256k')
+                        page.locator('#metadata-form input[name=artist]').fill('Studio (128k)')
+                        page.locator('#cover-file').set_input_files(str(latest_image))
                         page.get_by_text('직접 올린 이미지', exact=True).wait_for()
                     page.get_by_role('button', name='확인하고 MP3 만들기 →').click()
                     page.wait_for_function('(n) => document.querySelectorAll("a.download").length >= n', arg=index + 1, timeout=20000)
@@ -105,7 +113,19 @@ def main():
                 assert str(tags['TIT2']) == '검증곡'
                 assert str(tags['TPE1']) == 'Studio'
                 picture = Image.open(io.BytesIO(tags.getall('APIC')[0].data))
-                assert picture.getpixel((0, 0))[0] > 200
+                assert picture.getpixel((0, 0))[1] > 100
+                assert picture.getpixel((0, 0))[0] < 50
+                assert '128k' not in download.suggested_filename and '256k' not in download.suggested_filename
+                # A completed item can be corrected without uploading again.
+                page.get_by_role('button', name='정보 수정', exact=True).first.click()
+                page.get_by_role('button', name='정보 확인 →').first.click(timeout=15000)
+                assert page.locator('#metadata-form input[name=title]').input_value() == '검증곡'
+                assert '원본 길이' in page.locator('#source-description').inner_text()
+                page.locator('#metadata-form input[name=title]').fill('수정곡 (256kbps)')
+                page.locator('#cover-file').set_input_files(str(latest_image))
+                page.get_by_text('직접 올린 이미지', exact=True).wait_for()
+                page.get_by_role('button', name='확인하고 MP3 만들기 →').click()
+                page.wait_for_function('() => [...document.querySelectorAll("#tracks strong")].every(el => el.textContent === "수정곡")', timeout=20000)
                 # A poll must leave an unchanged audio element connected.
                 page.locator('audio').first.evaluate('(element) => element.dataset.identity = "retained"')
                 page.wait_for_timeout(2300)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "id3-sit-web"
-version = "0.1.0"
+version = "0.2.0"
 description = "Browser-based audio conversion and conservative ID3 metadata management"
 requires-python = ">=3.11"
 dependencies = ["flask>=3.1,<4", "waitress>=3,<4", "mutagen>=1.47,<2", "requests>=2.32,<3", "Pillow>=10,<13"]

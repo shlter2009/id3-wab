@@ -244,7 +244,8 @@ def test_manual_cover_upload_preview_and_embedding(app, audio):
     tags = ID3(io.BytesIO(client.get(ready['download']).data))
     assert tags.getall('APIC') and tags.getall('APIC')[0].mime == 'image/jpeg'
     assert client.delete(f'/api/jobs/{job_id}/artwork', headers=HEADERS).status_code == 409
-    assert client.post(f'/api/jobs/{job_id}/research', json={'artists': []}, headers=HEADERS).status_code == 409
+    assert client.post(f'/api/jobs/{job_id}/research', json={'artists': []}, headers=HEADERS).status_code == 202
+    wait_for(client, job_id, 'awaiting')
 
 
 def test_cover_validation_isolation_and_explicit_removal(app, audio):
@@ -342,3 +343,131 @@ def test_artist_aliases_keep_release_link_and_cover(app, audio):
     tags = ID3(io.BytesIO(client.get(ready['download']).data))
     assert str(tags['TPE1']) == '드레이크'
     assert tags.getall('APIC') and calls == ['release']
+
+
+def test_tagless_reversed_upload_searches_both_orders_without_artist_registry(app, audio, monkeypatch):
+    from music_manager.core import Network
+    calls = []
+    def response(self, url, params):
+        calls.append(params['query'])
+        if params['query'] == 'recording:"Wu\\-Tang Forever" AND artist:"Drake"':
+            return {'recordings': [{'title': 'Wu‐Tang Forever', 'score': 100, 'length': 217693,
+                'artist-credit': [{'name': 'Drake'}], 'releases': [{'id': 'release',
+                    'title': 'Nothing Was the Same', 'date': '2013-09-24'}]}]}
+        return {'recordings': []}
+    monkeypatch.setattr(Network, 'json', response)
+    app.extensions['jobs'].network_factory = Network
+    client = app.test_client()
+    job_id = upload(client, audio.read_bytes(), 'Wu-Tang Forever - Drake (128k).wav').json['job']['id']
+    job = wait_for(client, job_id, 'awaiting')
+    assert len(calls) == 2
+    assert (job['hint']['artist'], job['hint']['title']) == ('Drake', 'Wu-Tang Forever')
+    assert job['name'] == 'Wu-Tang Forever - Drake.wav'
+    assert job['source_name'] == 'Wu-Tang Forever - Drake (128k).wav'
+    assert job['candidates'][0]['album'] == 'Nothing Was the Same'
+    assert not job['search_failed']
+
+
+def test_network_busy_is_distinct_from_no_matching_recordings(app, audio):
+    import requests
+    class Busy:
+        def search(self, hint):
+            response = requests.Response()
+            response.status_code = 503
+            raise requests.HTTPError(response=response)
+    app.extensions['jobs'].network_factory = Busy
+    client = app.test_client()
+    job_id = upload(client, audio.read_bytes()).json['job']['id']
+    job = wait_for(client, job_id, 'awaiting')
+    assert job['search_failed'] and 'HTTP 503' in job['warning']
+    class Empty:
+        def search(self, hint):return []
+    app.extensions['jobs'].network_factory = Empty
+    client.post(f'/api/jobs/{job_id}/research', json={'artists': []}, headers=HEADERS)
+    job = wait_for(client, job_id, 'awaiting')
+    assert not job['search_failed'] and '일치하는 후보' in job['warning']
+
+
+def test_reimport_and_edit_completed_audio_replace_dirty_tags_without_duplicate_files(app, audio):
+    client = app.test_client()
+    old = upload(client, audio.read_bytes()).json['job']['id']
+    wait_for(client, old, 'awaiting')
+    confirm(client, old)
+    wait_for(client, old, 'completed')
+    new = upload(client, audio.read_bytes(), 'Song - Drake 256k.wav').json['job']['id']
+    wait_for(client, new, 'awaiting')
+    metadata = dict(META, title='Wu-Tang Forever 128k', artist='Drake (256k)')
+    confirm(client, new, metadata, candidate=None)
+    job = wait_for(client, new, 'completed')
+    tags = ID3(io.BytesIO(client.get(job['download']).data))
+    assert (str(tags['TIT2']), str(tags['TPE1'])) == ('Wu-Tang Forever', 'Drake')
+    assert 'Drake - Wu-Tang Forever.mp3' in client.get(job['download']).headers['Content-Disposition']
+    listing = client.get('/api/jobs').json['jobs']
+    assert all(j['metadata']['artist'] == 'Drake' for j in listing)
+    assert all(client.get(j['download']).status_code == 200 for j in listing)
+    output = Path(app.config['DATA_ROOT'])
+    assert len(list(output.glob('*/library/*.mp3'))) == 1
+    # Reopening a completed item must allow a second correction on the same audio.
+    assert client.post(f'/api/jobs/{new}/research', json={'artists': []}, headers=HEADERS).status_code == 202
+    wait_for(client, new, 'awaiting')
+    confirm(client, new, dict(metadata, title='Corrected 256kbps'), candidate=None)
+    job = wait_for(client, new, 'completed')
+    assert job['metadata']['title'] == 'Corrected'
+    assert len(list(output.glob('*/library/*.mp3'))) == 1
+    assert client.delete(f'/api/jobs/{old}', headers=HEADERS).status_code == 200
+    assert client.get(job['download']).status_code == 200
+
+
+def test_album_group_cover_fallback_and_identity_detachment(app, audio):
+    calls = []
+    class GroupNetwork:
+        def search(self, hint):
+            return [Metadata(**META, release_id='release', release_group_id='group')]
+        def cover(self, release_id):
+            calls.append(('release', release_id))
+            return None
+        def cover_group(self, group_id):
+            calls.append(('group', group_id))
+            return image_bytes()
+    app.extensions['jobs'].network_factory = GroupNetwork
+    client = app.test_client()
+    job_id = upload(client, audio.read_bytes()).json['job']['id']
+    wait_for(client, job_id, 'awaiting')
+    client.post(f'/api/jobs/{job_id}/artwork/search', json={'metadata': META, 'candidate': 0}, headers=HEADERS)
+    job = wait_for(client, job_id, 'awaiting')
+    assert job['artwork']['source'] == '같은 앨범의 대표 커버'
+    assert calls == [('release', 'release'), ('group', 'group')]
+    confirm(client, job_id, dict(META, title='Another Song'))
+    job = wait_for(client, job_id, 'completed')
+    assert not ID3(io.BytesIO(client.get(job['download']).data)).getall('APIC')
+
+
+def test_version_and_cache_headers_allow_deployment_check(app):
+    client = app.test_client()
+    assert client.get('/healthz').json['version'] == '0.2.0'
+    assert client.get('/api/jobs').json['version'] == '0.2.0'
+    assert client.get('/').headers['Cache-Control'] == 'no-cache'
+    assert client.get('/static/app.js').headers['Cache-Control'] == 'no-cache'
+
+
+def test_multiple_query_jobs_space_next_search_after_previous_finishes(tmp_path, audio, monkeypatch):
+    from types import SimpleNamespace
+    from music_manager.web import Jobs
+    clock = [100.0]
+    starts, finishes = [], []
+    def sleep(delay):clock[0] += delay
+    monkeypatch.setattr('music_manager.web.time', SimpleNamespace(
+        monotonic=lambda: clock[0], time=lambda: clock[0], sleep=sleep))
+    class SlowSearch:
+        def search(self, hint):
+            starts.append(clock[0])
+            clock[0] += 3  # A multi-query search lasting over one rate-limit interval.
+            finishes.append(clock[0])
+            return []
+    jobs = Jobs(tmp_path / 'data', [], SlowSearch)
+    try:
+        for _ in range(2):
+            job = jobs.add('owner', audio.name, str(audio))
+            jobs.prepare(job)
+        assert starts[1] - finishes[0] >= 1.09
+    finally:jobs.executor.shutdown(wait=True)

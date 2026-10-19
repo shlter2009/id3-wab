@@ -18,16 +18,18 @@ from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse
 
+import requests
 from flask import Flask, jsonify, request, send_file, session
 from werkzeug.exceptions import HTTPException
 from PIL import Image, ImageOps
 
 from .core import Library, Metadata, Network, confirm_metadata, read_embedded_cover, read_hint, safe_name, same_identity
-from .artists import canonical_artist, validate_artists
+from .artists import canonical_artist, clean_title, search_key, validate_artists
 
 AUDIO_EXTENSIONS = {'.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg', '.opus', '.aiff', '.aif', '.wma'}
 ACTIVE = {'queued', 'searching', 'converting', 'covering'}
 METADATA_FIELDS = ('title', 'artist', 'album', 'year', 'genre')
+APP_VERSION = '0.2.0'
 
 
 class PublicNetwork(Network):
@@ -77,6 +79,7 @@ class Job:
     progress: float = 0
     error: str = ''
     warning: str = ''
+    search_failed: bool = False
     hint: Metadata = field(default_factory=Metadata)
     candidates: list[Metadata] = field(default_factory=list)
     metadata: Metadata | None = None
@@ -145,8 +148,10 @@ class Jobs:
 
     def view(self, job):
         with self.lock:
-            return {'id': job.id, 'name': job.name, 'status': job.status,
+            display_name = clean_title(Path(job.name).stem) + Path(job.name).suffix
+            return {'id': job.id, 'name': display_name, 'source_name': job.name, 'status': job.status,
                     'progress': job.progress, 'error': job.error, 'warning': job.warning,
+                    'search_failed': job.search_failed,
                     'hint': asdict(job.hint), 'candidates': [asdict(c) for c in job.candidates],
                     'metadata': asdict(job.metadata) if job.metadata else None,
                     'duplicate': job.duplicate,
@@ -154,13 +159,24 @@ class Jobs:
                                 'version': job.cover_version, 'message': job.cover_message,
                                 'disabled': job.cover_disabled,
                                 'metadata': asdict(job.cover_for) if job.cover_for else None},
-                    'download': f'/api/jobs/{job.id}/download' if job.output else None,
-                    'cover': f'/api/jobs/{job.id}/cover' if job.output and job.has_cover else None}
+                    'download': f'/api/jobs/{job.id}/download' if job.output and job.status == 'completed' else None,
+                    'cover': f'/api/jobs/{job.id}/cover' if job.output and job.has_cover and job.status == 'completed' else None}
+
+    @staticmethod
+    def search_error(exc):
+        if isinstance(exc, requests.HTTPError) and exc.response is not None:
+            code = exc.response.status_code
+            if code in {429, 503}:
+                return f'MusicBrainz가 일시적으로 혼잡합니다(HTTP {code}). 잠시 후 다시 검색하세요.'
+            return f'MusicBrainz 요청이 거절되었습니다(HTTP {code}). 다시 검색하거나 직접 입력하세요.'
+        if isinstance(exc, requests.Timeout):
+            return 'MusicBrainz 응답 시간이 초과됐습니다. 다시 검색하거나 직접 입력하세요.'
+        return 'MusicBrainz에 연결하지 못했습니다. 다시 검색하거나 직접 입력하세요.'
 
     def prepare(self, job, query=None, redownload=True):
         network = None
         try:
-            self.update(job, status='searching', progress=.05, error='', warning='')
+            self.update(job, status='searching', progress=.05, error='', warning='', search_failed=False)
             network = self.network_factory()
             if job.remote:
                 local = self.workspace(job.owner) / job.id / safe_name(job.name)
@@ -170,7 +186,7 @@ class Jobs:
             else:
                 local = Path(job.source)
             original = read_hint(local, job.artists)
-            hint = query or original
+            hint = replace(query, duration=original.duration) if query else original
             self.update(job, hint=hint, original_hint=original, progress=.35)
             try:
                 embedded = read_embedded_cover(local) if same_identity(hint, original) else None
@@ -181,19 +197,39 @@ class Jobs:
                         cover_version=job.cover_version + 1, cover_message='', cover_disabled=False)
             candidates = []
             warning = ''
+            search_failed = False
             try:
                 with self.mb_lock:
                     time.sleep(max(0, 1.1 - (time.monotonic() - self.last_mb)))
-                    self.last_mb = time.monotonic()
-                    candidates = network.search(hint)
+                    try:
+                        candidates = network.search(hint)
+                    finally:
+                        # search() may issue multiple, individually throttled
+                        # requests. Space the NEXT job after the last one too.
+                        self.last_mb = time.monotonic()
                     candidates = [replace(candidate, artist=canonical_artist(candidate.artist, job.artists))
                                   for candidate in candidates]
-            except Exception:
-                warning = '음악 정보 검색에 연결하지 못했습니다. 원본 정보를 확인하거나 직접 입력할 수 있습니다.'
+            except Exception as exc:
+                search_failed = True
+                warning = self.search_error(exc)
+            # Only correct an unregistered filename order when an exact pair
+            # is present in the returned suggestions. The user still chooses
+            # the recording and album; a search result is never saved silently.
+            names = {artist['name'] for artist in job.artists}
+            if query is None and hint.artist and hint.artist not in names:
+                direct = any(search_key(c.title) == search_key(hint.title) and
+                             search_key(c.artist) == search_key(hint.artist) for c in candidates)
+                reverse = any(search_key(c.title) == search_key(hint.artist) and
+                              search_key(c.artist) == search_key(hint.title) for c in candidates)
+                if reverse and not direct:
+                    hint = replace(hint, title=hint.artist, artist=hint.title)
+                    warning = '제목과 가수의 순서를 바꿔 일치하는 후보를 찾았습니다. 곡과 앨범을 확인해 선택하세요.'
+            if not candidates and not search_failed:
+                warning = '일치하는 후보를 찾지 못했습니다. 제목·가수를 수정해 다시 검색하거나 직접 입력하세요.'
             if job.artists and hint.artist not in {artist['name'] for artist in job.artists}:
                 warning = ('아티스트 목록과 일치하는 이름을 찾지 못했습니다. 가수를 직접 확인하세요. ' + warning).strip()
             self.update(job, hint=hint, candidates=candidates, warning=warning,
-                        status='awaiting', progress=.4)
+                        status='awaiting', progress=.4, search_failed=search_failed)
         except Exception as exc:
             self.update(job, status='failed', error=str(exc))
         finally:
@@ -204,7 +240,7 @@ class Jobs:
     def fetch_cover(network, metadata):
         errors = []
         ids = list(dict.fromkeys([metadata.release_id, *metadata.other_release_ids]))
-        if not any(ids):
+        if not any(ids) and not metadata.release_group_id:
             return None, '', '앨범 후보를 선택한 뒤 커버를 찾거나 이미지를 직접 올려주세요.'
         for index, release_id in enumerate(ids[:4]):
             if not release_id:
@@ -213,6 +249,13 @@ class Jobs:
                 picture = network.cover(release_id)
                 if picture:
                     return picture, ('선택한 발매판' if index == 0 else '같은 앨범의 다른 발매판'), ''
+            except Exception:
+                errors.append('온라인 커버 요청에 실패했습니다.')
+        if metadata.release_group_id and hasattr(network, 'cover_group'):
+            try:
+                picture = network.cover_group(metadata.release_group_id)
+                if picture:
+                    return picture, '같은 앨범의 대표 커버', ''
             except Exception:
                 errors.append('온라인 커버 요청에 실패했습니다.')
         return None, '', ('온라인 커버 요청에 실패했습니다. 다시 시도하거나 이미지를 올려주세요.' if errors
@@ -272,10 +315,19 @@ class Jobs:
             with self.library_locks[job.owner]:
                 library = Library(self.workspace(job.owner) / 'library')
                 output, duplicate = library.process(local, job.metadata, cover,
-                    lambda p: self.update(job, progress=.45 + p * .55))
-            self.update(job, output=output, duplicate=duplicate, status='completed', progress=1,
-                        metadata=read_hint(output), has_cover=bool(read_embedded_cover(output)),
-                        warning=' '.join(warnings))
+                    lambda p: self.update(job, progress=.45 + p * .55), update_duplicate=True)
+                actual = read_hint(output)
+                has_cover = bool(read_embedded_cover(output))
+                if library.updated_from:
+                    with self.lock:
+                        for peer in self.jobs.values():
+                            if peer.owner == job.owner and peer.output == library.updated_from:
+                                self.update(peer, output=output, has_cover=has_cover,
+                                            cover_version=peer.cover_version + 1,
+                                            **({'metadata': actual} if peer.status == 'completed' else {}))
+                self.update(job, output=output, duplicate=duplicate, status='completed', progress=1,
+                            metadata=actual, has_cover=has_cover,
+                            warning=' '.join(warnings))
         except Exception as exc:
             self.update(job, status='failed', error=str(exc))
         finally:
@@ -320,6 +372,8 @@ def create_app(config=None, network_factory=None):
         response.headers['Content-Security-Policy'] = "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; media-src 'self'; frame-ancestors 'none'; base-uri 'none'"
         if request.path.startswith('/api/'):
             response.headers['Cache-Control'] = 'no-store'
+        elif request.path == '/' or request.path.startswith('/static/'):
+            response.headers['Cache-Control'] = 'no-cache'
         return response
 
     @app.errorhandler(Exception)
@@ -347,7 +401,8 @@ def create_app(config=None, network_factory=None):
 
     @app.get('/healthz')
     def health():
-        return jsonify(status='ok', ffmpeg=bool(shutil.which('ffmpeg'))), 200 if shutil.which('ffmpeg') else 503
+        return jsonify(status='ok', ffmpeg=bool(shutil.which('ffmpeg')), version=APP_VERSION,
+                       revision=os.environ.get('RENDER_GIT_COMMIT', '')[:12]), 200 if shutil.which('ffmpeg') else 503
 
     def json_body():
         data = request.get_json(silent=True)
@@ -366,7 +421,7 @@ def create_app(config=None, network_factory=None):
         if index is not None and (type(index) is not int or not 0 <= index < len(job.candidates)):
             raise ValueError('선택한 검색 결과가 올바르지 않습니다.')
         values = {k: values[k] for k in METADATA_FIELDS}
-        values['artist'] = canonical_artist(values['artist'], job.artists)
+        values['artist'] = canonical_artist(clean_title(values['artist']), job.artists)
         selected = job.candidates[index] if index is not None else job.hint
         selected = replace(selected, artist=canonical_artist(selected.artist, job.artists))
         return confirm_metadata(values, selected)
@@ -389,7 +444,8 @@ def create_app(config=None, network_factory=None):
     def listing():
         with jobs.lock:
             return jsonify(jobs=[jobs.view(j) for j in jobs.jobs.values() if j.owner == session['owner']],
-                           allowed_hosts=jobs.hosts)
+                           allowed_hosts=jobs.hosts, version=APP_VERSION,
+                           revision=os.environ.get('RENDER_GIT_COMMIT', '')[:12])
 
     @app.post('/api/jobs/upload')
     def upload():
@@ -486,12 +542,13 @@ def create_app(config=None, network_factory=None):
                 raise ValueError('검색할 곡 정보를 확인하세요.')
             if not values['title'].strip():
                 raise ValueError('검색할 곡 제목을 입력하세요.')
-            query = Metadata(**{k: values[k].strip() for k in METADATA_FIELDS})
+            query = Metadata(**{k: clean_title(values[k]) if k in {'title', 'artist'} else values[k].strip()
+                                for k in METADATA_FIELDS})
             query.artist = canonical_artist(query.artist, artists)
         with jobs.lock:
-            if job.status != 'awaiting':
+            if job.status not in {'awaiting', 'completed'}:
                 return jsonify(error='정보 확인 대기 중인 곡만 다시 검색할 수 있습니다.'), 409
-            jobs.update(job, artists=artists, status='queued', candidates=[], error='')
+            jobs.update(job, artists=artists, status='queued', candidates=[], error='', metadata=None)
         jobs.executor.submit(jobs.prepare, job, query, False)
         return jsonify(job=jobs.view(job)), 202
 

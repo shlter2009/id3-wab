@@ -327,4 +327,114 @@ def test_cover_alternatives_are_limited_to_same_release_group(monkeypatch):
     assert first.other_release_ids == ('second',)
     values = {key: getattr(first, key) for key in ('title', 'artist', 'album', 'year', 'genre')}
     assert confirm_metadata(values, first).other_release_ids == ('second',)
+    assert confirm_metadata(values, first).release_group_id == 'same'
     assert confirm_metadata(dict(values, album='Changed'), first).other_release_ids == ()
+    assert confirm_metadata(dict(values, album='Changed'), first).release_group_id == ''
+
+
+def test_quality_is_cleaned_from_existing_tags_and_saved_output(tmp_path, wav):
+    tagged, _ = Library(tmp_path / 'input').process(wav, Metadata('Song', 'Drake'))
+    # Simulate real downloaded files carrying dirty title AND artist tags.
+    from mutagen.id3 import TIT2, TPE1
+    tags = ID3(tagged)
+    tags.add(TIT2(encoding=1, text='Wu-Tang Forever 128k'))
+    tags.add(TPE1(encoding=1, text='드레이크 [256kbps]'))
+    tags.save(tagged)
+    hint = read_hint(tagged, [{'name': 'Drake', 'aliases': ['드레이크']}])
+    assert (hint.title, hint.artist) == ('Wu-Tang Forever', 'Drake')
+    candidate = Metadata('Wu-Tang Forever', 'Drake', 'Album', '2013', release_id='release')
+    values = dict(title='Wu-Tang Forever (256k)', artist='Drake 128k', album='Album', year='2013', genre='')
+    confirmed = confirm_metadata(values, candidate)
+    assert confirmed.release_id == 'release'
+    result, _ = Library(tmp_path / 'out').process(tagged, confirmed, cover())
+    assert result.name == 'Drake - Wu-Tang Forever.mp3'
+    assert str(ID3(result)['TIT2']) == 'Wu-Tang Forever'
+    assert str(ID3(result)['TPE1']) == 'Drake'
+    assert ID3(result).getall('APIC')
+
+
+def test_search_retries_reversed_filename_and_keeps_album_link(monkeypatch):
+    queries = []
+    def response(url, params):
+        queries.append(params['query'])
+        if params['query'] == 'recording:"Wu\\-Tang Forever" AND artist:"Drake"':
+            return {'recordings': [{
+                'title': 'Wu‐Tang Forever', 'artist-credit': [{'name': 'Drake'}],
+                'score': 100, 'length': 217693, 'releases': [
+                    {'id': 'album-release', 'title': 'Nothing Was the Same', 'date': '2013-09-24',
+                     'release-group': {'id': 'group', 'primary-type': 'Album'}}]}]}
+        return {'recordings': []}
+    network = Network()
+    monkeypatch.setattr(network, 'json', response)
+    candidates = network.search(Metadata('Drake (128k)', 'Wu-Tang Forever 256k', duration=217.704))
+    assert len(queries) == 2
+    assert candidates[0].artist == 'Drake'
+    assert candidates[0].album == 'Nothing Was the Same'
+    assert candidates[0].release_id == 'album-release'
+    assert candidates[0].duration == pytest.approx(217.693)
+
+
+def test_title_only_search_does_not_return_unrelated_songs(monkeypatch):
+    queries = []
+    def response(url, params):
+        queries.append(params['query'])
+        if 'artist:' in params['query']:
+            return {'recordings': []}
+        return {'recordings': [
+            {'title': 'Song', 'artist-credit': [{'name': 'Actual Artist'}]},
+            {'title': 'Unrelated Song', 'artist-credit': [{'name': 'Someone'}]}]}
+    network = Network()
+    monkeypatch.setattr(network, 'json', response)
+    candidates = network.search(Metadata('Song', 'Mistaken Artist'))
+    assert len(queries) == 3
+    assert [(c.title, c.artist) for c in candidates] == [('Song', 'Actual Artist')]
+
+
+def test_duplicate_can_update_confirmed_tags_name_cover_and_all_hash_aliases(tmp_path, wav):
+    library = Library(tmp_path / 'out')
+    old, _ = library.process(wav, Metadata('Wrong title', 'Wrong artist'))
+    old_bytes = old.read_bytes()
+    new, duplicate = library.process(wav, Metadata('Wu-Tang Forever 256k', 'Drake (128k)'),
+                                     cover(), update_duplicate=True)
+    assert duplicate and library.updated_from == old
+    assert not old.exists()
+    assert new.name == 'Drake - Wu-Tang Forever.mp3'
+    assert str(ID3(new)['TIT2']) == 'Wu-Tang Forever'
+    assert ID3(new).getall('APIC')
+    assert len(list(library.output.glob('*.mp3'))) == 1
+    # Both the original PCM and the generated MP3 fingerprints must point to it.
+    reimport = tmp_path / 'old-download.mp3'
+    reimport.write_bytes(old_bytes)
+    target, duplicate = Library(library.output).process(reimport, Metadata('Other', 'Other'))
+    assert duplicate and target == new
+
+
+@pytest.mark.parametrize('same_name', [False, True])
+def test_duplicate_update_rollback_keeps_previous_file_and_index(tmp_path, wav, monkeypatch, same_name):
+    import os
+    library = Library(tmp_path / 'out')
+    old, _ = library.process(wav, Metadata('Song', 'Artist'))
+    before, index_before = old.read_bytes(), library.index_path.read_bytes()
+    real_replace = os.replace
+    def fail_index(source, target):
+        if target == library.index_path:
+            raise OSError('index disk error')
+        return real_replace(source, target)
+    monkeypatch.setattr(os, 'replace', fail_index)
+    with pytest.raises(OSError, match='index disk error'):
+        library.process(wav, Metadata('Song' if same_name else 'New', 'Artist', album='New album'),
+                        update_duplicate=True)
+    assert old.read_bytes() == before
+    assert library.index_path.read_bytes() == index_before
+    assert list(library.output.glob('*.mp3')) == [old]
+
+
+def test_duplicate_update_preserves_unrelated_filename_collision(tmp_path, wav):
+    library = Library(tmp_path / 'out')
+    old, _ = library.process(wav, Metadata('Wrong', 'Artist'))
+    unrelated = library.output / 'Drake - Song.mp3'
+    unrelated.write_bytes(b'existing unrelated file')
+    new, duplicate = library.process(wav, Metadata('Song', 'Drake'), update_duplicate=True)
+    assert duplicate and new.name == 'Drake - Song (2).mp3'
+    assert unrelated.read_bytes() == b'existing unrelated file'
+    assert not old.exists()
