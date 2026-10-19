@@ -21,7 +21,8 @@ from PIL import Image
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from .artists import canonical_artist, clean_title, filename_hint, search_key
+from .artists import canonical_artist, clean_title, filename_hint, search_key, split_album_hint
+from .release import VERSION
 
 
 @dataclass
@@ -36,6 +37,14 @@ class Metadata:
     duration: float | None = None
     other_release_ids: tuple[str, ...] = ()
     release_group_id: str = ''
+    credited_artists: tuple[str, ...] = ()
+
+
+def artist_matches(candidate: Metadata, expected: str) -> bool:
+    """Recognize a credited artist, including explicit featuring credits."""
+    names = [candidate.artist, *candidate.credited_artists]
+    names.extend(re.split(r'\s+(?:feat\.?|ft\.?|featuring|with)\s+', candidate.artist, flags=re.I))
+    return search_key(expected) in {search_key(name) for name in names}
 
 
 class MusicBrainzRetry(Retry):
@@ -53,7 +62,7 @@ def session() -> requests.Session:
     s.mount("https://musicbrainz.org/", HTTPAdapter(max_retries=MusicBrainzRetry(
         total=3, backoff_factor=0.7, status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"], respect_retry_after_header=False)))
-    s.headers["User-Agent"] = "ID3SitWeb/0.2 (https://github.com/shlter2009/id3-wab)"
+    s.headers["User-Agent"] = f"ID3SitWeb/{VERSION} (https://github.com/shlter2009/id3-wab)"
     return s
 
 
@@ -61,6 +70,7 @@ class Network:
     def __init__(self):
         self.http = session()
         self.last_mb = 0.0
+        self.search_queries: list[str] = []
 
     def json(self, url, params=None):
         # MusicBrainz allows at most one request per second per client.
@@ -109,13 +119,14 @@ class Network:
         These are suggestions for user confirmation, never automatic matches.
         Scores from different MusicBrainz queries aren't directly comparable.
         """
+        self.search_queries.clear()
         hint = replace(hint, title=clean_title(hint.title), artist=clean_title(hint.artist))
         if not hint.title:
             return []
         direct = self._search_recordings(hint)
         def exact(candidate, query):
             return (search_key(candidate.title) == search_key(query.title) and
-                    (not query.artist or search_key(candidate.artist) == search_key(query.artist)))
+                    (not query.artist or artist_matches(candidate, query.artist)))
         if any(exact(candidate, hint) for candidate in direct):
             return self._rank(direct, hint)
         results = list(direct)
@@ -125,11 +136,12 @@ class Network:
             if any(exact(candidate, reverse) for candidate in swapped):
                 return self._rank(swapped, reverse)
             results.extend(swapped)
-        titles = list(dict.fromkeys(filter(None, (hint.title, hint.artist))))
-        # The artist part may itself be a title in a reversed filename.
-        results.extend(self._search_recordings(replace(hint, artist=''), titles=titles))
-        title_keys = {search_key(title) for title in titles}
-        relevant = [candidate for candidate in results if search_key(candidate.title) in title_keys]
+        results.extend(self._search_recordings(replace(hint, artist='')))
+        # An artist's name alone is not evidence that a same-named SONG is
+        # relevant. Reversed results must match both sides of the filename.
+        relevant = [candidate for candidate in results if search_key(candidate.title) == search_key(hint.title)
+                    or hint.artist and search_key(candidate.title) == search_key(hint.artist)
+                    and artist_matches(candidate, hint.title)]
         unique = {}
         for candidate in relevant:
             key = (search_key(candidate.title), search_key(candidate.artist), candidate.release_id,
@@ -141,17 +153,19 @@ class Network:
     def _rank(candidates, hint):
         return sorted(candidates, key=lambda candidate: (
             search_key(candidate.title) != search_key(hint.title),
-            bool(hint.artist) and search_key(candidate.artist) != search_key(hint.artist),
+            bool(hint.artist) and not artist_matches(candidate, hint.artist),
+            bool(hint.album) and search_key(candidate.album) != search_key(hint.album),
             (abs(candidate.duration - hint.duration) if candidate.duration is not None
              and hint.duration is not None else float('inf')),
             -candidate.score))
 
-    def _search_recordings(self, hint, titles=None):
+    def _search_recordings(self, hint):
         def escape(text):
             return re.sub(r'([+\-&|!(){}\[\]^"~*?:\\/])', r'\\\1', text)
-        query = ' OR '.join(f'recording:"{escape(title)}"' for title in (titles or [hint.title]))
+        query = f'recording:"{escape(hint.title)}"'
         if hint.artist:
             query += f' AND artist:"{escape(hint.artist)}"'
+        self.search_queries.append(query)
         data = self.json("https://musicbrainz.org/ws/2/recording/",
                          {"query": query, "fmt": "json", "limit": 10})
         results = []
@@ -174,7 +188,9 @@ class Network:
                                         tuple(r['id'] for r in releases if r.get('id') != release.get('id')
                                               and r.get('id') and release.get('release-group', {}).get('id')
                                               and r.get('release-group', {}).get('id') == release['release-group']['id'])[:3],
-                                        release.get('release-group', {}).get('id', '')))
+                                        release.get('release-group', {}).get('id', ''),
+                                        tuple(a.get('name', a.get('artist', {}).get('name', ''))
+                                              for a in rec.get('artist-credit', []))))
         return results
 
     def cover(self, release_id: str) -> bytes | None:
@@ -203,9 +219,10 @@ class Network:
                 return output.getvalue()
 
 
-def read_hint(path: Path, artists=()) -> Metadata:
-    artist, title = filename_hint(path.stem, artists)
-    hint = Metadata(title=title, artist=artist)
+def read_hint(path: Path, artists=(), *, filename: str | None = None) -> Metadata:
+    artist, title = filename_hint(Path(filename).stem if filename else path.stem, artists)
+    title, album = split_album_hint(title)
+    hint = Metadata(title=title, artist=artist, album=album)
     try:
         audio = File(path, easy=True)
         if audio is not None:

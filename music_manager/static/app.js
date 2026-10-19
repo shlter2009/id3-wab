@@ -67,7 +67,15 @@ function render() {
 async function refresh() {
   if(state.loading)return;
   state.loading=true;
-  try {const data=await api('/api/jobs');state.jobs=data.jobs;state.allowed=data.allowed_hosts;$('#app-version').textContent=`ID3 Sit Web · v${data.version||'0.2.0'}`;$('#app-version').title=data.revision?`배포 버전 ${data.revision}`:'';$('#allowed-hosts').textContent='허용 호스트: '+(state.allowed.join(', ')||'없음 · 파일 업로드를 이용해 주세요.');render();}
+  try {
+    const data=await api('/api/jobs');state.jobs=data.jobs;state.allowed=data.allowed_hosts;
+    if(data.version&&data.version!==document.documentElement.dataset.version){
+      $('#update-message').textContent=`새 버전 v${data.version}이 배포됐습니다. 새로고침하여 최신 검색 기능을 사용하세요.`;
+      $('#update-notice').hidden=false;
+    }
+    $('#app-version').title=data.revision?`배포 버전 ${data.revision}`:'';
+    $('#allowed-hosts').textContent='허용 호스트: '+(state.allowed.join(', ')||'없음 · 파일 업로드를 이용해 주세요.');render();
+  }
   catch(error){if(!$('#login-dialog').open)toast(error.message);}
   finally{state.loading=false;}
 }
@@ -119,6 +127,7 @@ function edit(id){
   const job=state.jobs.find(j=>j.id===id);if(!job||job.status!=='awaiting')return;
   state.editing=job;state.candidate=null;state.researching=null;warning('#form-error','');
   $('#source-description').textContent=job.name+(job.hint.duration?` · 원본 길이 ${job.hint.duration.toFixed(1)}초`:'');
+  paintSearchInfo(job);
   warning('#metadata-warning',job.warning);
   renderCandidates(job);
   fillMetadata(job.hint,null);$('#metadata-dialog').showModal();syncEditor();
@@ -154,6 +163,7 @@ function syncEditor(){
   if(!$('#metadata-dialog').open||!state.editing)return;
   const job=state.jobs.find(j=>j.id===state.editing.id)||state.editing;
   state.editing=job;
+  paintSearchInfo(job);
   if(state.researching===job.id&&job.status==='awaiting'){
     state.researching=null;state.candidate=null;renderCandidates(job);fillMetadata(job.hint,null);warning('#metadata-warning',job.warning);
   }
@@ -162,6 +172,13 @@ function syncEditor(){
   document.querySelectorAll('.candidate').forEach(button=>button.disabled=busy);
   if(state.researching)warning('#metadata-warning','입력한 정보로 다시 검색하고 있습니다…');
   paintArtwork(job);
+}
+function paintSearchInfo(job){
+  const info=job.search_info||{};
+  const parts=[`제목: ${info.title||job.hint.title||'미상'}`,`가수: ${info.artist||job.hint.artist||'미상'}`];
+  if(info.album)parts.push(`앨범 힌트: ${info.album}`);
+  parts.push(`MusicBrainz · 후보 ${job.candidates.length}개`);
+  $('#search-description').textContent=parts.join(' / ');
 }
 function acceptJob(job){
   state.jobs=state.jobs.map(item=>item.id===job.id?job:item);if(state.editing?.id===job.id)state.editing=job;render();
@@ -189,6 +206,7 @@ async function findCover(){
   catch(error){warning('#form-error',error.message);}
 }
 $('#research-artists').addEventListener('click',()=>research(false));
+$('#reload-version').addEventListener('click',()=>window.location.reload());
 $('#research-fields').addEventListener('click',()=>research(true));
 $('#cover-search').addEventListener('click',findCover);
 $('#cover-upload-button').addEventListener('click',()=>$('#cover-file').click());

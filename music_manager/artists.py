@@ -49,13 +49,25 @@ BITRATES = r'(?:32|40|48|56|64|80|96|112|128|144|160|192|224|256|288|320|384|448
 BARE_QUALITY = (r'(?:\d{2,4}\s*(?:kbps|kb/s|kbits?/s)|' + BITRATES +
                 r'\s*k|(?:8|16|24|32)\s*bit|\d{2,3}(?:\.\d+)?\s*khz)')
 QUALITY = re.compile(r'(?<![^\W_])' + BARE_QUALITY + r'(?![^\W_])', re.I)
+LYRIC_LABEL = r'(?:official\s+)?(?:lyrics?|가사|한글가사|자막)(?:[\s/&·_-]*(?:lyrics?|가사|한글가사|자막))*'
+LYRIC_SUFFIX = re.compile(r'(?:\s*[\[(]\s*' + LYRIC_LABEL + r'\s*[\])]|\s*[|ㅣᅵ┃│]\s*' + LYRIC_LABEL + r')\s*$', re.I)
+VERSION_LABEL = re.compile(r'\b(?:live|remix|remaster(?:ed)?|edit|acoustic|instrumental|demo|version|feat|ft|mix|sped|slowed|reverb|part|pt|mono|stereo|radio|extended|cover)\b', re.I)
 
 
 def clean_title(value: str) -> str:
     text = unicodedata.normalize('NFKC', value)
     text = QUALITY.sub(' ', QUALITY_GROUP.sub(' ', text))
     text = re.sub(r'\(\s*\)|\[\s*\]', ' ', text)
+    text = LYRIC_SUFFIX.sub('', text)
     return re.sub(r'\s+', ' ', text).strip(' \t\r\n_-–—|,;/')
+
+
+def split_album_hint(title: str) -> tuple[str, str]:
+    """A trailing filename [album] is a hint, never a replacement for ID3."""
+    match = re.fullmatch(r'(.+?)\s*\[([^\[\]]+)\]', title)
+    if match and not VERSION_LABEL.search(match[2]) and not re.fullmatch(r'\d{4}', match[2].strip()):
+        return match[1].strip(), match[2].strip()
+    return title, ''
 
 
 def search_key(value: str) -> str:

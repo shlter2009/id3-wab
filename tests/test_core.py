@@ -438,3 +438,39 @@ def test_duplicate_update_preserves_unrelated_filename_collision(tmp_path, wav):
     assert duplicate and new.name == 'Drake - Song (2).mp3'
     assert unrelated.read_bytes() == b'existing unrelated file'
     assert not old.exists()
+
+
+def test_featured_artist_is_a_match_without_unrelated_title_searches(monkeypatch):
+    queries = []
+    title = 'Do Not Go Gentle Into That Good Night'
+    def response(url, params):
+        queries.append(params['query'])
+        return {'recordings': [{'title': title, 'score': 100, 'length': 303000,
+            'artist-credit': [{'name': 'JUSTHIS', 'joinphrase': ' feat. '},
+                              {'name': 'KWAII', 'joinphrase': ', '}, {'name': 'Don Malik'}],
+            'releases': [{'id': 'correct', 'title': title + ' II', 'date': '2022-01-01'}]}]}
+    network = Network()
+    monkeypatch.setattr(network, 'json', response)
+    candidates = network.search(Metadata(title, 'JUSTHIS', duration=304.17))
+    assert len(queries) == 1
+    assert candidates[0].credited_artists == ('JUSTHIS', 'KWAII', 'Don Malik')
+    assert candidates[0].artist == 'JUSTHIS feat. KWAII, Don Malik'
+    assert candidates[0].release_id == 'correct'
+
+
+def test_artist_name_as_song_title_is_not_a_fallback_match(monkeypatch):
+    network = Network()
+    monkeypatch.setattr(network, 'json', lambda *a, **k: {'recordings': [
+        {'title': 'Justhis', 'artist-credit': [{'name': 'JUSTHIS'}], 'length': 201000},
+        {'title': 'Justhis', 'artist-credit': [{'name': 'Quasimoly'}], 'length': 202000}]})
+    assert network.search(Metadata('Do Not Go Gentle Into That Good Night', 'JUSTHIS', duration=304.17)) == []
+
+
+def test_long_original_filename_is_independent_of_storage_name(wav):
+    original = ('JUSTHIS - Do Not Go Gentle Into That Good Night '
+                '[Do Not Go Gentle Into That Good Night II]ㅣLyrics가사.wav')
+    hint = read_hint(wav, filename=original)
+    assert hint.title == 'Do Not Go Gentle Into That Good Night'
+    assert hint.artist == 'JUSTHIS'
+    assert hint.album == 'Do Not Go Gentle Into That Good Night II'
+    assert hint.duration > 0

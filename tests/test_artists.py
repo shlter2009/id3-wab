@@ -1,5 +1,5 @@
 import pytest
-from music_manager.artists import canonical_artist, clean_title, filename_hint, validate_artists
+from music_manager.artists import canonical_artist, clean_title, filename_hint, split_album_hint, validate_artists
 
 RULES = [{'name': 'Drake', 'aliases': ['드레이크']}, {'name': 'Rihanna', 'aliases': ['리한나']}]
 
@@ -62,3 +62,18 @@ def test_preserve_version_and_clean_only_quality():
 def test_quality_markers_with_or_without_brackets(text, expected):
     assert clean_title(text) == expected
     assert clean_title(clean_title(text)) == expected
+
+
+@pytest.mark.parametrize('suffix', ['ㅣLyrics가사', 'ᅵLyrics가사', '| Lyrics', '│가사', ' [Lyrics]', ' (Official Lyrics)'])
+def test_lyrics_suffix_is_not_sent_as_title(suffix):
+    assert clean_title('Song' + suffix) == 'Song'
+
+
+def test_album_annotation_is_separate_from_versions_and_real_lyrics_titles():
+    title = 'Do Not Go Gentle Into That Good Night'
+    assert split_album_hint(title + ' [Do Not Go Gentle Into That Good Night II]') == (
+        title, 'Do Not Go Gentle Into That Good Night II')
+    for title in ['Song [Live]', 'Song [Remix feat. Artist]', 'Song [Radio Edit]', 'Song [Part II]', 'Song [2022]']:
+        assert split_album_hint(title) == (title, '')
+    for title in ['No Lyrics', 'Lyrics of Love', '24K Magic', 'Song (Remix)']:
+        assert clean_title(title) == title

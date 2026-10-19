@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "id3-sit-web"
-version = "0.2.0"
+dynamic = ["version"]
 description = "Browser-based audio conversion and conservative ID3 metadata management"
 requires-python = ">=3.11"
 dependencies = ["flask>=3.1,<4", "waitress>=3,<4", "mutagen>=1.47,<2", "requests>=2.32,<3", "Pillow>=10,<13"]
@@ -18,8 +18,11 @@ id3-sit-web = "music_manager.web:main"
 [tool.setuptools.packages.find]
 include = ["music_manager*"]
 
+[tool.setuptools.dynamic]
+version = {attr = "music_manager.release.VERSION"}
+
 [tool.setuptools.package-data]
-music_manager = ["static/*"]
+music_manager = ["static/*", "templates/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

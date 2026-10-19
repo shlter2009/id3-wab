@@ -3,6 +3,7 @@ import os
 import subprocess
 import time
 import uuid
+from music_manager.release import VERSION
 
 CODE = '''
 import os, json, subprocess, tempfile, urllib.request
@@ -12,9 +13,11 @@ from music_manager.core import Library, Metadata
 assert os.getuid() == 10001
 with urllib.request.urlopen('http://127.0.0.1:8000/healthz') as response:
     health=json.load(response)
-    assert health['ffmpeg'] and health['version'] == '0.2.0'
+    assert health['ffmpeg'] and health['version'] == os.environ['ID3_EXPECTED_VERSION']
 with urllib.request.urlopen('http://127.0.0.1:8000/') as response:
-    assert '음악에 정보를 입히다' in response.read().decode()
+    html=response.read().decode()
+    assert '음악에 정보를 입히다' in html
+    assert '현재 버전 v'+os.environ['ID3_EXPECTED_VERSION'] in html and '{{' not in html
 with tempfile.TemporaryDirectory() as folder:
     root=Path(folder); audio=root/'sample.wav'
     subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','sine=frequency=440:duration=0.2',str(audio)],check=True)
@@ -26,7 +29,7 @@ with tempfile.TemporaryDirectory() as folder:
     updated, duplicate=library.process(audio,Metadata('수정곡','ID3 Sit'),update_duplicate=True)
     assert duplicate and not target.exists() and updated.name == 'ID3 Sit - 수정곡.mp3'
     assert len(list((root/'out').glob('*.mp3'))) == 1
-print('Non-root v0.2.0 container, website, FFmpeg, quality cleanup and duplicate retagging passed')
+print('Non-root v'+health['version']+' container, website, FFmpeg, quality cleanup and duplicate retagging passed')
 '''
 
 
@@ -38,7 +41,8 @@ def main():
     def run(args, **kwargs):
         return subprocess.run(docker + args, **kwargs)
     try:
-        run(['run', '--detach', '--name', name, '--network', 'none', 'id3-sit-web:latest'], check=True, capture_output=True)
+        run(['run', '--detach', '--name', name, '--network', 'none', '-e',
+             'ID3_EXPECTED_VERSION='+VERSION, 'id3-sit-web:latest'], check=True, capture_output=True)
         for attempt in range(40):
             running = run(['inspect', '--format', '{{.State.Running}}', name], capture_output=True, text=True, check=True)
             if running.stdout.strip() != 'true':

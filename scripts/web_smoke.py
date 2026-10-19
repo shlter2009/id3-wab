@@ -13,6 +13,7 @@ from playwright.sync_api import sync_playwright
 from waitress import create_server
 
 from music_manager.core import Metadata
+from music_manager.release import VERSION
 from music_manager.web import create_app
 
 
@@ -47,6 +48,11 @@ def main():
                 errors = []
                 page.on('pageerror', lambda error: errors.append(str(error)))
                 page.goto(f'http://127.0.0.1:{server.effective_port}', wait_until='networkidle')
+                assert page.locator('#header-version').inner_text() == 'v'+VERSION
+                page.locator('#release-notes summary').click()
+                page.get_by_text('긴 원본 파일명을 보존하고 Lyrics·가사 표기와 [앨범명]을 구분해 검색합니다.', exact=True).first.wait_for()
+                assert page.locator('#release-notes').get_attribute('open') is not None
+                page.locator('#release-notes summary').click()
                 page.locator('#manage-artists').click()
                 page.locator('#artist-name').fill('Studio')
                 page.locator('#artist-aliases').fill('스튜디오')
@@ -82,6 +88,7 @@ def main():
                 page.locator('#stat-total').get_by_text('2', exact=False).wait_for()
                 for index in range(2):
                     page.get_by_role('button', name='정보 확인 →').first.click(timeout=15000)
+                    assert 'v'+VERSION in page.locator('#dialog-version').inner_text()
                     assert page.locator('#metadata-form input[name=artist]').input_value() == 'Studio'
                     assert page.locator('#metadata-form input[name=title]').input_value() == 'Sample'
                     assert '128k' not in page.locator('#source-description').inner_text()
@@ -132,6 +139,8 @@ def main():
                 assert page.locator('audio').first.get_attribute('data-identity') == 'retained'
                 page.screenshot(path='/tmp/id3-web-completed-desktop.png', full_page=True)
                 page.set_viewport_size({'width': 390, 'height': 844})
+                assert page.locator('#header-version').is_visible()
+                assert page.locator('#release-notes summary').is_visible()
                 page.screenshot(path='/tmp/id3-web-mobile.png', full_page=True)
                 assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), 'mobile overflow'
                 page.locator('#manage-artists').click()
@@ -144,9 +153,31 @@ def main():
                 page.once('dialog', lambda dialog: dialog.accept())
                 page.locator('.remove-job').first.click()
                 page.wait_for_function('() => document.querySelectorAll("#tracks tr").length === 1')
+                long_source = root / ('JUSTHIS - Do Not Go Gentle Into That Good Night '
+                                      '[Do Not Go Gentle Into That Good Night II]ㅣLyrics가사.wav')
+                shutil.copyfile(source, long_source)
+                page.locator('#file-input').set_input_files(str(long_source))
+                page.get_by_role('button', name='정보 확인 →').first.click(timeout=15000)
+                assert page.locator('#metadata-form input[name=title]').input_value() == 'Do Not Go Gentle Into That Good Night'
+                assert page.locator('#metadata-form input[name=artist]').input_value() == 'JUSTHIS'
+                assert page.locator('#metadata-form input[name=album]').input_value() == 'Do Not Go Gentle Into That Good Night II'
+                assert 'v'+VERSION in page.locator('#dialog-version').inner_text()
+                page.locator('#close-dialog').click()
+                # An open old page must report a newer server without changing
+                # its own displayed version to pretend the new UI is loaded.
+                def newer_version(route):
+                    response = route.fetch()
+                    payload = response.json()
+                    payload['version'] = '99.0.0'
+                    route.fulfill(response=response, json=payload)
+                page.route('**/api/jobs', newer_version)
+                page.locator('#update-notice').wait_for(state='visible', timeout=10000)
+                assert '99.0.0' in page.locator('#update-message').inner_text()
+                assert page.locator('#header-version').inner_text() == 'v'+VERSION
+                page.unroute('**/api/jobs', newer_version)
                 assert not errors, errors
                 browser.close()
-                print('Browser artist CRUD and persistence, corrected filenames, research, cover preview and upload, MP3 download, duplicates and mobile layout passed')
+                print('Browser version/history and update notice, full-length filenames, artists, research, covers, downloads, duplicate editing and mobile layout passed')
         finally:
             app.extensions['jobs'].executor.shutdown(wait=True)
             server.close()

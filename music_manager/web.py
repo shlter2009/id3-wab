@@ -19,17 +19,17 @@ from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse
 
 import requests
-from flask import Flask, jsonify, request, send_file, session
+from flask import Flask, jsonify, render_template, request, send_file, session
 from werkzeug.exceptions import HTTPException
 from PIL import Image, ImageOps
 
-from .core import Library, Metadata, Network, confirm_metadata, read_embedded_cover, read_hint, safe_name, same_identity
+from .core import Library, Metadata, Network, artist_matches, confirm_metadata, read_embedded_cover, read_hint, safe_name, same_identity
 from .artists import canonical_artist, clean_title, search_key, validate_artists
+from .release import HISTORY, VERSION as APP_VERSION
 
 AUDIO_EXTENSIONS = {'.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg', '.opus', '.aiff', '.aif', '.wma'}
 ACTIVE = {'queued', 'searching', 'converting', 'covering'}
 METADATA_FIELDS = ('title', 'artist', 'album', 'year', 'genre')
-APP_VERSION = '0.2.0'
 
 
 class PublicNetwork(Network):
@@ -80,6 +80,7 @@ class Job:
     error: str = ''
     warning: str = ''
     search_failed: bool = False
+    search_info: dict = field(default_factory=dict)
     hint: Metadata = field(default_factory=Metadata)
     candidates: list[Metadata] = field(default_factory=list)
     metadata: Metadata | None = None
@@ -152,6 +153,7 @@ class Jobs:
             return {'id': job.id, 'name': display_name, 'source_name': job.name, 'status': job.status,
                     'progress': job.progress, 'error': job.error, 'warning': job.warning,
                     'search_failed': job.search_failed,
+                    'search_info': job.search_info,
                     'hint': asdict(job.hint), 'candidates': [asdict(c) for c in job.candidates],
                     'metadata': asdict(job.metadata) if job.metadata else None,
                     'duplicate': job.duplicate,
@@ -160,7 +162,7 @@ class Jobs:
                                 'disabled': job.cover_disabled,
                                 'metadata': asdict(job.cover_for) if job.cover_for else None},
                     'download': f'/api/jobs/{job.id}/download' if job.output and job.status == 'completed' else None,
-                    'cover': f'/api/jobs/{job.id}/cover' if job.output and job.has_cover and job.status == 'completed' else None}
+                    'cover': f'/api/jobs/{job.id}/cover?v={job.cover_version}' if job.output and job.has_cover and job.status == 'completed' else None}
 
     @staticmethod
     def search_error(exc):
@@ -185,7 +187,7 @@ class Jobs:
                     network.download(job.source, local, lambda p: self.update(job, progress=.05 + p * .25))
             else:
                 local = Path(job.source)
-            original = read_hint(local, job.artists)
+            original = read_hint(local, job.artists, filename=job.name)
             hint = replace(query, duration=original.duration) if query else original
             self.update(job, hint=hint, original_hint=original, progress=.35)
             try:
@@ -218,9 +220,9 @@ class Jobs:
             names = {artist['name'] for artist in job.artists}
             if query is None and hint.artist and hint.artist not in names:
                 direct = any(search_key(c.title) == search_key(hint.title) and
-                             search_key(c.artist) == search_key(hint.artist) for c in candidates)
+                             artist_matches(c, hint.artist) for c in candidates)
                 reverse = any(search_key(c.title) == search_key(hint.artist) and
-                              search_key(c.artist) == search_key(hint.title) for c in candidates)
+                              artist_matches(c, hint.title) for c in candidates)
                 if reverse and not direct:
                     hint = replace(hint, title=hint.artist, artist=hint.title)
                     warning = '제목과 가수의 순서를 바꿔 일치하는 후보를 찾았습니다. 곡과 앨범을 확인해 선택하세요.'
@@ -229,7 +231,12 @@ class Jobs:
             if job.artists and hint.artist not in {artist['name'] for artist in job.artists}:
                 warning = ('아티스트 목록과 일치하는 이름을 찾지 못했습니다. 가수를 직접 확인하세요. ' + warning).strip()
             self.update(job, hint=hint, candidates=candidates, warning=warning,
-                        status='awaiting', progress=.4, search_failed=search_failed)
+                        status='awaiting', progress=.4, search_failed=search_failed,
+                        search_info={'provider': 'MusicBrainz', 'title': hint.title,
+                                     'artist': hint.artist, 'album': hint.album,
+                                     'attempts': len(getattr(network, 'search_queries', [])),
+                                     'results': len(candidates), 'version': APP_VERSION,
+                                     'state': 'error' if search_failed else 'matched' if candidates else 'no_results'})
         except Exception as exc:
             self.update(job, status='failed', error=str(exc))
         finally:
@@ -370,7 +377,7 @@ def create_app(config=None, network_factory=None):
         response.headers['X-Content-Type-Options'] = 'nosniff'
         response.headers['Referrer-Policy'] = 'same-origin'
         response.headers['Content-Security-Policy'] = "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; media-src 'self'; frame-ancestors 'none'; base-uri 'none'"
-        if request.path.startswith('/api/'):
+        if request.path.startswith('/api/') or request.path == '/version.json':
             response.headers['Cache-Control'] = 'no-store'
         elif request.path == '/' or request.path.startswith('/static/'):
             response.headers['Cache-Control'] = 'no-cache'
@@ -397,7 +404,12 @@ def create_app(config=None, network_factory=None):
 
     @app.get('/')
     def index():
-        return app.send_static_file('index.html')
+        return render_template('index.html', version=APP_VERSION, history=HISTORY,
+                               revision=os.environ.get('RENDER_GIT_COMMIT', '')[:12])
+
+    @app.get('/version.json')
+    def version_info():
+        return jsonify(version=APP_VERSION, revision=os.environ.get('RENDER_GIT_COMMIT', '')[:12], history=HISTORY)
 
     @app.get('/healthz')
     def health():
@@ -412,6 +424,12 @@ def create_app(config=None, network_factory=None):
 
     def artist_rules(value):
         return validate_artists(value)
+
+    def source_name(value):
+        name = Path(value.replace('\\', '/')).name
+        if not name or len(name) > 1000 or any(ord(char) < 32 for char in name):
+            raise ValueError('파일 이름은 제어 문자 없이 1~1000자로 입력하세요.')
+        return name
 
     def chosen_metadata(job, data):
         values = data.get('metadata', {})
@@ -452,19 +470,18 @@ def create_app(config=None, network_factory=None):
         upload = request.files.get('file')
         if not upload or not upload.filename:
             raise ValueError('오디오 파일을 선택하세요.')
-        original = Path(upload.filename.replace('\\', '/')).name
+        original = source_name(upload.filename)
         suffix = Path(original).suffix.lower()
         if suffix not in AUDIO_EXTENSIONS:
             raise ValueError('지원하는 오디오 파일 형식이 아닙니다.')
-        name = safe_name(Path(original).stem) + suffix
         try:
             artists = artist_rules(json.loads(request.form.get('artists', '[]')))
         except json.JSONDecodeError as exc:
             raise ValueError('아티스트 목록 형식이 올바르지 않습니다.') from exc
-        job = jobs.add(session['owner'], name)
+        job = jobs.add(session['owner'], original)
         job.artists = artists
         folder = jobs.workspace(job.owner) / job.id
-        local = folder / name
+        local = folder / ('source' + suffix)
         try:
             folder.mkdir(parents=True)
             size = 0
@@ -498,7 +515,7 @@ def create_app(config=None, network_factory=None):
         # Fail unsupported hosts without occupying a worker or making any request.
         if not any(host == h or h.startswith('*.') and host.endswith(h[1:]) for h in jobs.hosts):
             raise ValueError('허용되지 않은 호스트입니다. 파일 업로드를 이용하세요.')
-        name = safe_name(Path(unquote(parsed.path)).name or 'download.audio')
+        name = source_name(unquote(parsed.path) or 'download.audio')
         artists = artist_rules(data.get('artists', []))
         job = jobs.add(session['owner'], name, url, remote=True)
         job.artists = artists

@@ -9,6 +9,7 @@ import pytest
 from mutagen.id3 import ID3
 
 from music_manager.core import Metadata
+from music_manager.release import VERSION
 from music_manager.web import PublicNetwork, create_app
 
 HEADERS = {'X-Requested-With': 'ID3Sit'}
@@ -444,10 +445,64 @@ def test_album_group_cover_fallback_and_identity_detachment(app, audio):
 
 def test_version_and_cache_headers_allow_deployment_check(app):
     client = app.test_client()
-    assert client.get('/healthz').json['version'] == '0.2.0'
-    assert client.get('/api/jobs').json['version'] == '0.2.0'
+    assert client.get('/healthz').json['version'] == VERSION
+    assert client.get('/api/jobs').json['version'] == VERSION
     assert client.get('/').headers['Cache-Control'] == 'no-cache'
     assert client.get('/static/app.js').headers['Cache-Control'] == 'no-cache'
+
+
+def test_original_filename_survives_upload_without_truncation(app, audio):
+    client = app.test_client()
+    original = ('JUSTHIS - Do Not Go Gentle Into That Good Night '
+                '[Do Not Go Gentle Into That Good Night II]ㅣLyrics가사.wav')
+    job_id = upload(client, audio.read_bytes(), original).json['job']['id']
+    job = wait_for(client, job_id, 'awaiting')
+    assert job['source_name'] == original
+    assert job['hint']['title'] == 'Do Not Go Gentle Into That Good Night'
+    assert job['hint']['artist'] == 'JUSTHIS'
+    assert job['hint']['album'] == 'Do Not Go Gentle Into That Good Night II'
+    assert Path(app.extensions['jobs'].jobs[job_id].source).name == 'source.wav'
+    assert job['search_info']['title'] == job['hint']['title']
+    assert job['search_info']['version'] == VERSION
+
+
+def test_visible_version_history_and_public_version_endpoint_before_login(app):
+    app.config['WEB_PASSWORD'] = 'test-password'
+    client = app.test_client()
+    page = client.get('/').text
+    assert f'현재 버전 v{VERSION}' in page
+    assert f'id="dialog-version">STEP 02 / 03 · v{VERSION}' in page
+    assert f'/static/app.js?v={VERSION}' in page
+    assert '수정 내역 보기' in page and '긴 원본 파일명' in page
+    assert '{{' not in page
+    assert client.get('/api/jobs').status_code == 401
+    version = client.get('/version.json')
+    assert version.status_code == 200
+    assert version.json['version'] == VERSION == version.json['history'][0]['version']
+    assert version.headers['Cache-Control'] == 'no-store'
+
+
+def test_duplicate_cover_update_changes_shared_preview_url(app, audio):
+    from PIL import Image
+    client = app.test_client()
+    ids, original_url = [], None
+    for color in ('red', 'green'):
+        job_id = upload(client, audio.read_bytes()).json['job']['id']
+        ids.append(job_id)
+        wait_for(client, job_id, 'awaiting')
+        data = io.BytesIO()
+        Image.new('RGB', (20, 20), color).save(data, 'PNG')
+        client.post(f'/api/jobs/{job_id}/artwork/upload', data={'file': (io.BytesIO(data.getvalue()), 'art.png')}, headers=HEADERS)
+        confirm(client, job_id)
+        ready = wait_for(client, job_id, 'completed')
+        if original_url is None:original_url = ready['cover']
+    listing = client.get('/api/jobs').json['jobs']
+    first = next(job for job in listing if job['id'] == ids[0])
+    assert first['cover'] != original_url
+    for job in listing:
+        picture = Image.open(io.BytesIO(client.get(job['cover']).data))
+        assert picture.getpixel((0, 0))[1] > 100
+        assert picture.getpixel((0, 0))[0] < 50
 
 
 def test_multiple_query_jobs_space_next_search_after_previous_finishes(tmp_path, audio, monkeypatch):
