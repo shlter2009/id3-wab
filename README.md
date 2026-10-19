@@ -30,6 +30,7 @@ Windows PowerShell에서는 `.venv\Scripts\python`을 사용합니다. 기본 �
 
 ```sh
 docker build -t id3-sit-web .
+python scripts/container_smoke.py
 docker run --rm -p 8000:8000 --name id3-sit-web id3-sit-web
 ```
 
